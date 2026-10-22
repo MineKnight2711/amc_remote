@@ -1,0 +1,113 @@
+export type QualityPreset = 'ultra' | 'balanced' | 'low';
+
+export interface NetworkInterfaceInfo {
+  name: string;
+  address: string;
+  type: 'vpn' | 'lan' | 'other';
+  label: string; // e.g. "Tailscale VPN", "ZeroTier", "Wi-Fi / LAN"
+}
+
+export interface SavedDevice {
+  id: string; // Remote device unique ID (or ip:port fallback)
+  name: string; // Remote device hostname or custom alias
+  ip: string;
+  port: number;
+  platform: string; // 'win32' | 'darwin' | 'linux'
+  trustToken: string; // Issued by host upon first successful password authentication
+  savedPassword?: string; // Optional encrypted/local fallback if user wants password remembered too
+  lastConnectedAt: number;
+  online?: boolean;
+  latencyMs?: number;
+}
+
+export interface TrustedController {
+  controllerId: string;
+  controllerName: string;
+  platform: string;
+  tokenHash: string;
+  createdAt: number;
+  lastUsedAt: number;
+}
+
+export interface AppConfig {
+  deviceId: string;
+  deviceName: string;
+  listenPort: number;
+  password: string; // Plaintext or viewable password on host machine so user can see/change it easily
+  passwordHash: string;
+  hostSecret: string;
+  autoStart: boolean;
+  minimizeToTray: boolean;
+  defaultQuality: QualityPreset;
+  allowClipboardSync: boolean;
+  savedDevices: SavedDevice[];
+  trustedControllers: TrustedController[];
+}
+
+export interface DisplaySourceInfo {
+  id: string; // desktopCapturer source id e.g. 'screen:0:0'
+  displayId: string;
+  name: string;
+  width: number;
+  height: number;
+  scaleFactor: number;
+  bounds: { x: number; y: number; width: number; height: number };
+  isPrimary: boolean;
+}
+
+export type RemoteInputEvent =
+  | {
+      type: 'mousemove';
+      x: number; // Normalized 0.0 -> 1.0 within active display
+      y: number; // Normalized 0.0 -> 1.0 within active display
+      displayId?: string;
+    }
+  | {
+      type: 'mousedown' | 'mouseup';
+      button: 'left' | 'middle' | 'right';
+      x: number;
+      y: number;
+      displayId?: string;
+    }
+  | {
+      type: 'wheel';
+      deltaX: number;
+      deltaY: number;
+      x?: number;
+      y?: number;
+    }
+  | {
+      type: 'keydown' | 'keyup';
+      key: string;
+      code: string;
+      keyCode: number;
+      ctrlKey?: boolean;
+      shiftKey?: boolean;
+      altKey?: boolean;
+      metaKey?: boolean;
+    }
+  | {
+      type: 'special-combo';
+      combo: 'ctrl-alt-del' | 'alt-tab' | 'win-key' | 'cmd-space' | 'task-manager';
+    }
+  | {
+      type: 'clipboard-set';
+      text: string;
+    };
+
+export interface HostPublicInfo {
+  deviceId: string;
+  deviceName: string;
+  platform: string;
+  port: number;
+  version: string;
+}
+
+export interface ActiveSessionInfo {
+  sessionId: string;
+  controllerId: string;
+  controllerName: string;
+  remoteIp: string;
+  connectedAt: number;
+  authMethod: 'password' | 'trust-token';
+}

@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SwiftDesk — Điều Khiển Máy Tính Từ Xa Tốc Độ Cao</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- Main Application Shell -->
+  <div id="app-shell" class="app-shell">
+    <!-- Top Header / Status Bar -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-logo">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+            <line x1="8" y1="21" x2="16" y2="21"></line>
+            <line x1="12" y1="17" x2="12" y2="21"></line>
+          </svg>
+        </div>
+        <div>
+          <div class="brand-title">SwiftDesk <span class="badge-pro">60FPS WebRTC</span></div>
+          <div class="brand-subtitle">Điều khiển nội bộ &amp; Internet P2P (Windows &amp; macOS)</div>
+        </div>
+      </div>
+
+      <div class="topbar-status">
+        <div class="status-pill online" id="service-status-pill">
+          <span class="status-dot"></span>
+          <span id="service-status-text">Sẵn sàng nhận kết nối (Port 9876)</span>
+        </div>
+        <div class="status-pill" id="os-badge-pill">
+          <span id="os-badge-text">Windows</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- macOS Permission Banner (Hidden on Windows or when granted) -->
+    <div id="mac-permission-banner" class="alert-banner hidden">
+      <div class="alert-content">
+        <strong>Cần cấp quyền trên macOS:</strong> Để điều khiển chuột/bàn phím và ghi hình màn hình trên macOS, vui lòng cấp quyền <em>Accessibility</em> và <em>Screen Recording</em> trong System Settings.
+      </div>
+      <button id="btn-mac-permissions" class="btn btn-sm btn-warning">Kiểm tra &amp; Cấp quyền</button>
+    </div>
+
+    <!-- Active Incoming Session Banner (Shown when someone is controlling this computer) -->
+    <div id="incoming-session-banner" class="incoming-banner hidden">
+      <div class="incoming-info">
+        <span class="pulse-ring"></span>
+        <div>
+          <strong id="incoming-title">Đang có thiết bị điều khiển máy của bạn</strong>
+          <div id="incoming-subtitle" class="incoming-sub">IP: 100.x.x.x — Đã xác thực bảo mật</div>
+        </div>
+      </div>
+      <div id="incoming-session-actions" class="incoming-actions"></div>
+    </div>
+
+    <!-- Main 2-Column Workspace -->
+    <main class="workspace-grid">
+      <!-- LEFT COLUMN: THIS COMPUTER (HOST CREDENTIALS & SETTINGS) -->
+      <section class="panel host-panel">
+        <div class="panel-header">
+          <div>
+            <h2>Máy tính của bạn (Host)</h2>
+            <p class="panel-desc">Chia sẻ IP và mật khẩu dưới đây để máy khác điều khiển máy này</p>
+          </div>
+          <button id="btn-refresh-net" class="btn btn-icon" title="Làm mới danh sách IP mạng">
+            ↻ Làm mới IP
+          </button>
+        </div>
+
+        <!-- Device ID & Hostname Card -->
+        <div class="info-box">
+          <div class="info-row">
+            <div>
+              <span class="label-muted">Tên thiết bị</span>
+              <div class="value-lg" id="host-device-name">Đang tải...</div>
+            </div>
+            <div class="text-right">
+              <span class="label-muted">Cổng kết nối (Port)</span>
+              <div class="value-mono" id="host-port-display">9876</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Network IP Addresses (VPN / Tailscale / ZeroTier / LAN) -->
+        <div class="section-block">
+          <div class="section-label-row">
+            <span class="section-label">Địa chỉ IP kết nối (Click để sao chép IP:Port)</span>
+          </div>
+          <div id="network-list" class="network-list">
+            <!-- Populated dynamically -->
+          </div>
+        </div>
+
+        <!-- Password Setup Card -->
+        <div class="section-block password-card">
+          <div class="section-label-row">
+            <span class="section-label">Mật khẩu cố định (Truy cập 1 lần đầu)</span>
+            <span class="badge-hint">Lưu tự động sau lần đầu</span>
+          </div>
+          <div class="password-input-group">
+            <input
+              type="password"
+              id="host-password-input"
+              class="input-control mono-input"
+              placeholder="Nhập mật khẩu bảo vệ..."
+              autocomplete="off"
+            />
+            <button id="btn-toggle-pass" class="btn btn-ghost" title="Hiện / Ẩn mật khẩu">Hiện</button>
+            <button id="btn-random-pass" class="btn btn-ghost" title="Tạo mật khẩu ngẫu nhiên">Ngẫu nhiên</button>
+            <button id="btn-save-pass" class="btn btn-primary">Lưu mật khẩu</button>
+          </div>
+          <p class="help-text">
+            Khi máy khác nhập đúng mật khẩu này ở lần đầu tiên, máy sẽ được cấp mã tin cậy để các lần sau kết nối 1-chạm không cần nhập lại.
+          </p>
+        </div>
+
+        <!-- Startup & System Settings -->
+        <div class="section-block settings-card">
+          <div class="section-label-row">
+            <span class="section-label">Cấu hình khởi động &amp; Hệ thống</span>
+          </div>
+
+          <label class="toggle-row">
+            <div>
+              <div class="toggle-title">Khởi động cùng Windows &amp; macOS</div>
+              <div class="toggle-desc">Tự động mở ngầm ở khay hệ thống ngay khi bật máy</div>
+            </div>
+            <input type="checkbox" id="chk-autostart" class="toggle-checkbox" checked />
+          </label>
+
+          <label class="toggle-row">
+            <div>
+              <div class="toggle-title">Thu nhỏ xuống System Tray khi đóng cửa sổ</div>
+              <div class="toggle-desc">Giữ kết nối luôn sẵn sàng 24/7 ngay cả khi tắt giao diện</div>
+            </div>
+            <input type="checkbox" id="chk-minimize-tray" class="toggle-checkbox" checked />
+          </label>
+
+          <label class="toggle-row">
+            <div>
+              <div class="toggle-title">Đồng bộ Clipboard 2 chiều</div>
+              <div class="toggle-desc">Cho phép sao chép văn bản nhanh giữa 2 máy</div>
+            </div>
+            <input type="checkbox" id="chk-clipboard-sync" class="toggle-checkbox" checked />
+          </label>
+
+          <div class="inline-form-row">
+            <div class="form-field">
+              <label for="input-device-name">Đổi tên máy</label>
+              <input type="text" id="input-device-name" class="input-control input-sm" />
+            </div>
+            <div class="form-field form-field-port">
+              <label for="input-listen-port">Port</label>
+              <input type="number" id="input-listen-port" class="input-control input-sm" min="1024" max="65535" />
+            </div>
+            <button id="btn-save-host-cfg" class="btn btn-secondary btn-sm">Áp dụng</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- RIGHT COLUMN: REMOTE CONTROL & SAVED DEVICES -->
+      <section class="panel remote-panel">
+        <!-- Quick Connect Box -->
+        <div class="connect-card">
+          <div class="panel-header">
+            <div>
+              <h2>Điều khiển thiết bị khác</h2>
+              <p class="panel-desc">Nhập IP (LAN, Tailscale, ZeroTier hoặc WAN IP) của máy cần điều khiển</p>
+            </div>
+          </div>
+
+          <form id="connect-form" class="connect-form">
+            <div class="connect-inputs-row">
+              <div class="form-field flex-2">
+                <label for="remote-ip-input">Địa chỉ IP hoặc IP:Port máy đích</label>
+                <input
+                  type="text"
+                  id="remote-ip-input"
+                  class="input-control mono-input input-lg"
+                  placeholder="VD: 100.85.12.34 hoặc 192.168.1.50:9876"
+                  required
+                />
+              </div>
+
+              <div class="form-field flex-1">
+                <label for="remote-password-input">Mật khẩu (Lần đầu)</label>
+                <input
+                  type="password"
+                  id="remote-password-input"
+                  class="input-control mono-input input-lg"
+                  placeholder="Nhập mật khẩu..."
+                />
+              </div>
+
+              <div class="form-field">
+                <label for="remote-quality-select">Chất lượng &amp; Tốc độ</label>
+                <select id="remote-quality-select" class="input-control input-lg">
+                  <option value="ultra">⚡ 60 FPS Siêu Mượt (Ultra)</option>
+                  <option value="balanced">🚀 60 FPS Cân Bằng</option>
+                  <option value="low">🌐 30 FPS Tiết Kiệm Mạng</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="connect-actions-row">
+              <div id="connect-status-msg" class="connect-status-msg"></div>
+              <button type="submit" id="btn-connect-now" class="btn btn-accent btn-lg">
+                <span>Kết nối &amp; Điều khiển ngay</span>
+              </button>
+            </div>
+          </form>
+        </div>
+
+        <!-- Saved Devices List (1-Click Reconnect without password) -->
+        <div class="saved-devices-section">
+          <div class="panel-header">
+            <div>
+              <h2>Thiết bị đã lưu (Kết nối 1-Chạm)</h2>
+              <p class="panel-desc">
+                Các máy đã kết nối thành công 1 lần sẽ tự động lưu tại đây — nhấn <strong>Kết nối ngay</strong> không cần nhập lại mật khẩu
+              </p>
+            </div>
+            <button id="btn-ping-saved" class="btn btn-icon" title="Kiểm tra trạng thái Online của các máy đã lưu">
+              ↻ Kiểm tra Online
+            </button>
+          </div>
+
+          <div id="saved-devices-grid" class="saved-devices-grid">
+            <!-- Populated dynamically -->
+          </div>
+        </div>
+
+        <!-- Trusted Controllers Section (Machines allowed to control this PC) -->
+        <div class="trusted-section">
+          <div class="section-label-row">
+            <span class="section-label">Thiết bị đã được cấp quyền điều khiển máy này</span>
+          </div>
+          <div id="trusted-controllers-list" class="trusted-list">
+            <!-- Populated dynamically -->
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- FULLSCREEN / OVERLAY REMOTE DESKTOP VIEWER SESSION -->
+  <div id="viewer-overlay" class="viewer-overlay hidden">
+    <!-- Floating Top Control Bar -->
+    <div id="viewer-toolbar" class="viewer-toolbar">
+      <div class="viewer-peer-info">
+        <span class="live-badge">● LIVE 60FPS</span>
+        <strong id="viewer-host-name">Remote PC</strong>
+        <span id="viewer-host-ip" class="viewer-ip-tag">100.x.x.x</span>
+      </div>
+
+      <div class="viewer-stats" id="viewer-stats">
+        <span id="stat-fps">60 FPS</span>
+        <span class="stat-sep">|</span>
+        <span id="stat-ping">1 ms</span>
+        <span class="stat-sep">|</span>
+        <span id="stat-res">1920x1080</span>
+      </div>
+
+      <div class="viewer-controls">
+        <select id="viewer-display-select" class="toolbar-select" title="Chọn màn hình của máy đích">
+          <option value="">Màn hình 1</option>
+        </select>
+
+        <select id="viewer-quality-select" class="toolbar-select" title="Đổi tốc độ khung hình / chất lượng">
+          <option value="ultra">60 FPS Ultra</option>
+          <option value="balanced">60 FPS Balanced</option>
+          <option value="low">30 FPS Low</option>
+        </select>
+
+        <button id="btn-viewer-scale" class="toolbar-btn" title="Đổi chế độ vừa khung hình / Tỉ lệ 1:1">
+          Vừa màn hình
+        </button>
+
+        <button id="btn-viewer-clipboard" class="toolbar-btn" title="Gửi Clipboard hiện tại sang máy đích">
+          📋 Gửi Clipboard
+        </button>
+
+        <button id="btn-viewer-alttab" class="toolbar-btn" title="Gửi tổ hợp phím Alt + Tab">
+          Alt+Tab
+        </button>
+
+        <button id="btn-viewer-winkey" class="toolbar-btn" title="Mở Start Menu / Spotlight (Win/Cmd)">
+          Win/Cmd
+        </button>
+
+        <button id="btn-viewer-fullscreen" class="toolbar-btn" title="Toàn màn hình (F11)">
+          ⛶ Toàn màn hình
+        </button>
+
+        <button id="btn-viewer-disconnect" class="toolbar-btn toolbar-btn-danger">
+          ✕ Ngắt kết nối
+        </button>
+      </div>
+    </div>
+
+    <!-- Video Canvas Container -->
+    <div id="viewer-stage" class="viewer-stage" tabindex="0">
+      <video id="remote-video" class="remote-video" autoplay playsinline muted></video>
+      <div id="viewer-loading" class="viewer-loading">
+        <div class="spinner"></div>
+        <div id="viewer-loading-text">Đang thiết lập kênh truyền hình ảnh 60FPS độ trễ thấp...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
