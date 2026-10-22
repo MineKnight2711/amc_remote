@@ -33,6 +33,11 @@ const api = {
   sendSignalToClient: (sessionId: string, payload: Record<string, unknown>) =>
     ipcRenderer.send('host:signal-to-client', { sessionId, payload }),
 
+  // UPnP port forwarding for WebRTC host candidates (resolves null when no public UPnP gateway)
+  mapUdpPort: (owner: string, ip: string, port: number) =>
+    ipcRenderer.invoke('nat:map-udp', { owner, ip, port }),
+  releaseUdpMappings: (owner: string) => ipcRenderer.send('nat:release', owner),
+
   // Client Cloud ID Session IPC
   startClientCloudSession: (sessionId: string) =>
     ipcRenderer.send('client:start-cloud-session', sessionId),

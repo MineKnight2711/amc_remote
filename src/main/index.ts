@@ -14,6 +14,7 @@ import { getLocalNetworkInterfaces, probeRemoteHost } from './network';
 import { InputController } from './input-controller';
 import { HostSignalingServer, isDeviceIdFormat } from './signaling-server';
 import { TrayManager } from './tray';
+import { UpnpPortMapper } from './upnp';
 import { RemoteInputEvent, SavedDevice } from '../shared/types';
 
 // Set standalone App Name & Bundle ID for macOS TCC & Windows
@@ -38,6 +39,7 @@ let inputController: InputController;
 let signalingServer: HostSignalingServer;
 let trayManager: TrayManager;
 let powerSaveId: number | null = null;
+const upnpMapper = new UpnpPortMapper();
 
 const isMultiInstanceAllowed = process.argv.includes('--multi-instance');
 const isAutoStarted = process.argv.includes('--autostart');
@@ -84,6 +86,10 @@ function createMainWindow(): void {
   });
 
   mainWindow.webContents.setBackgroundThrottling(false);
+  // Gather ICE only on the default-route interfaces (LAN IPv4 + public IPv6). With "default",
+  // Chromium's 5-network IPv6 cap gets filled by VPN/ULA/Teredo addresses (Radmin, Tailscale...)
+  // and the real public IPv6 — the only NAT-free direct path — is never offered to the peer.
+  mainWindow.webContents.setWebRTCIPHandlingPolicy('default_public_and_private_interfaces');
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
 
   mainWindow.on('close', (e) => {
@@ -120,6 +126,15 @@ function registerIpcHandlers(): void {
 
   ipcMain.on('client:send-cloud-msg', (_event, data: { targetDeviceId: string; payload: Record<string, unknown> }) => {
     signalingServer.sendClientCloudMessage(data.targetDeviceId, data.payload);
+  });
+
+  // UPnP: forward the router's UDP port to a WebRTC host candidate so the peer can reach us directly
+  ipcMain.handle('nat:map-udp', (_event, data: { owner: string; ip: string; port: number }) => {
+    return upnpMapper.mapUdp(data.owner, data.ip, data.port).catch(() => null);
+  });
+
+  ipcMain.on('nat:release', (_event, owner: string) => {
+    upnpMapper.releaseOwner(owner).catch(() => {});
   });
 
   ipcMain.handle('app:get-bootstrap', async () => {
@@ -310,20 +325,27 @@ app.whenReady().then(async () => {
   await AutoStartManager.setAutoStart(store.get().autoStart);
   await signalingServer.start(store.get().listenPort);
   trayManager.refreshMenu();
+  upnpMapper.warmUp();
 
   app.on('activate', () => {
     showMainWindow();
   });
 });
 
-app.on('before-quit', async () => {
+let quitCleanupDone = false;
+app.on('before-quit', (e) => {
   isQuitting = true;
+  if (quitCleanupDone) return;
+  // Hold the quit until router port mappings are removed (some routers only support permanent leases)
+  e.preventDefault();
+  quitCleanupDone = true;
   if (powerSaveId !== null && powerSaveBlocker.isStarted(powerSaveId)) {
     powerSaveBlocker.stop(powerSaveId);
   }
-  if (signalingServer) {
-    await signalingServer.stop();
-  }
+  const cleanup = Promise.all([signalingServer?.stop(), upnpMapper.releaseAll()]);
+  Promise.race([cleanup, new Promise((r) => setTimeout(r, 2000))])
+    .catch(() => {})
+    .finally(() => app.quit());
 });
 
 app.on('window-all-closed', () => {

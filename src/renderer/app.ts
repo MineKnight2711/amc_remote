@@ -83,6 +83,7 @@
     relayVideoEl: HTMLVideoElement | null;
     relayCanvas: HTMLCanvasElement | null;
     lastPointerSeq: number;
+    statsTimer: number | null;
   }
   const hostPeers = new Map<string, HostPeerSession>();
 
@@ -101,6 +102,16 @@
   let clientConnectTimer: number | null = null;
   let clientWebRtcFallbackTimer: number | null = null;
   let clientHasWebRtcVideo = false;
+  let clientNatOwner = '';
+  let lastHostStats: {
+    fps: number;
+    width: number;
+    height: number;
+    limit: string;
+    encoder: string;
+    codec: string;
+  } | null = null;
+  let lastDiagnostics = '';
 
   let activeRemoteDisplayId = '';
   let activeRemoteTargetLabel = '';
@@ -136,6 +147,54 @@
 
   function isValidSdp(sdp: any): sdp is RTCSessionDescriptionInit {
     return !!sdp && typeof sdp.type === 'string' && typeof sdp.sdp === 'string' && sdp.sdp.length > 0;
+  }
+
+  /**
+   * If our router supports UPnP and has a public IPv4, forward the UDP port of the LAN host candidate
+   * and advertise publicIP:port as an extra candidate. One reachable side is enough for P2P, even when
+   * the other side is behind a symmetric / carrier-grade NAT where STUN hole punching cannot work.
+   */
+  async function advertiseUpnpCandidate(
+    owner: string,
+    cand: RTCIceCandidate,
+    send: (init: RTCIceCandidateInit) => void
+  ): Promise<void> {
+    if (cand.type !== 'host' || cand.protocol !== 'udp' || !cand.address || !cand.port) return;
+    if (cand.address.includes(':')) return; // IPv6 needs no NAT mapping
+    const mapping: { externalIp: string; externalPort: number } | null = await swiftdesk
+      .mapUdpPort(owner, cand.address, cand.port)
+      .catch(() => null);
+    if (!mapping) return;
+
+    const priority = 100 * 2 ** 24 + 65535 * 2 ** 8 + 255; // srflx type preference, component 1
+    const foundation = String(Math.floor(Math.random() * 1e9));
+    send({
+      candidate:
+        `candidate:${foundation} 1 udp ${priority} ${mapping.externalIp} ${mapping.externalPort} ` +
+        `typ srflx raddr ${cand.address} rport ${cand.port} generation 0`,
+      sdpMid: cand.sdpMid,
+      sdpMLineIndex: cand.sdpMLineIndex,
+      usernameFragment: cand.usernameFragment,
+    });
+  }
+
+  /** Human-readable path of the selected ICE candidate pair, e.g. "P2P IPv6". */
+  function describeIcePath(local: any, remote: any): string {
+    if (!local || !remote) return 'P2P';
+    if (local.candidateType === 'relay' || remote.candidateType === 'relay') return 'TURN';
+    if (String(remote.address || '').includes(':')) return 'P2P IPv6';
+    if (local.candidateType === 'host' && remote.candidateType === 'host') return 'P2P LAN';
+    return 'P2P IPv4';
+  }
+
+  /** e.g. "host4 host6 srflx4" — tells at a glance whether a side offered IPv6 / public candidates. */
+  function summarizeCandidates(reports: Map<string, any>, type: 'local-candidate' | 'remote-candidate'): string {
+    const kinds = new Set<string>();
+    for (const r of reports.values()) {
+      if (r.type !== type) continue;
+      kinds.add(`${r.candidateType}${String(r.address || '').includes(':') ? '6' : '4'}`);
+    }
+    return [...kinds].sort().join(' ') || 'none';
   }
 
   /**
@@ -204,6 +263,7 @@
   const elViewerOverlay = document.getElementById('viewer-overlay')!;
   const elViewerHostName = document.getElementById('viewer-host-name')!;
   const elViewerHostIp = document.getElementById('viewer-host-ip')!;
+  const elViewerStats = document.getElementById('viewer-stats')!;
   const elStatFps = document.getElementById('stat-fps')!;
   const elStatPing = document.getElementById('stat-ping')!;
   const elStatRes = document.getElementById('stat-res')!;
@@ -525,17 +585,21 @@
   }
 
   /**
-   * Prefer H.264 so the host encodes with the hardware encoder (VideoToolbox on macOS,
-   * MediaFoundation on Windows) instead of software VP8, which cannot sustain 1440p/4K at 60 FPS.
+   * Electron encodes screen content in software (H.264 = OpenH264, not the GPU), so pick the fastest
+   * software screen codec. Measured on 2560x1600 full-screen motion: VP9 ~56 FPS, AV1 ~57, VP8 ~35-45,
+   * H.264 only ~15 FPS. VP9 is preferred over AV1 since it is mature and hardware-decoded almost everywhere.
    */
-  function preferHardwareFriendlyCodec(pc: RTCPeerConnection, sender: RTCRtpSender): void {
+  const SCREEN_CODEC_ORDER = ['video/vp9', 'video/av1', 'video/vp8', 'video/h264'];
+
+  function preferFastScreenCodec(pc: RTCPeerConnection, sender: RTCRtpSender): void {
     const transceiver = pc.getTransceivers().find((t) => t.sender === sender);
     const capabilities = RTCRtpReceiver.getCapabilities('video');
     if (!transceiver || !capabilities || typeof transceiver.setCodecPreferences !== 'function') return;
 
     const rank = (codec: RTCRtpCodec): number => {
-      if (codec.mimeType.toLowerCase() !== 'video/h264') return 2;
-      return /packetization-mode=1/.test(codec.sdpFmtpLine || '') ? 0 : 1;
+      const idx = SCREEN_CODEC_ORDER.indexOf(codec.mimeType.toLowerCase());
+      // RTX / RED / FEC keep their relative order after the media codecs
+      return idx === -1 ? SCREEN_CODEC_ORDER.length : idx;
     };
     const sorted = capabilities.codecs
       .map((codec, idx) => ({ codec, idx }))
@@ -698,18 +762,18 @@
         bindHostDataChannel(event.channel, sessionId);
       };
 
+      const sendIce = (candidate: RTCIceCandidateInit) =>
+        swiftdesk.sendSignalToClient(sessionId, { type: 'webrtc-ice', candidate });
       pc.onicecandidate = (event) => {
         if (event.candidate) {
-          swiftdesk.sendSignalToClient(sessionId, {
-            type: 'webrtc-ice',
-            candidate: event.candidate.toJSON(),
-          });
+          sendIce(event.candidate.toJSON());
+          advertiseUpnpCandidate(`host:${sessionId}`, event.candidate, sendIce);
         }
       };
 
       const videoTrack = stream.getVideoTracks()[0];
       const videoSender = pc.addTrack(videoTrack, stream);
-      preferHardwareFriendlyCodec(pc, videoSender);
+      preferFastScreenCodec(pc, videoSender);
       await tuneSenderEncoding(videoSender, quality);
 
       const peerSession: HostPeerSession = {
@@ -732,8 +796,32 @@
         relayVideoEl: null,
         relayCanvas: null,
         lastPointerSeq: 0,
+        statsTimer: null,
       };
       hostPeers.set(sessionId, peerSession);
+
+      // Share encoder health with the viewer so it can tell CPU/bandwidth limits from network issues
+      peerSession.statsTimer = window.setInterval(async () => {
+        if (reliableChannel.readyState !== 'open') return;
+        try {
+          const stats = await pc.getStats();
+          stats.forEach((r: any) => {
+            if (r.type !== 'outbound-rtp' || r.kind !== 'video') return;
+            const codec = r.codecId ? (stats as any).get(r.codecId) : null;
+            reliableChannel.send(
+              JSON.stringify({
+                type: 'host-stats',
+                fps: r.framesPerSecond || 0,
+                width: r.frameWidth || 0,
+                height: r.frameHeight || 0,
+                limit: r.qualityLimitationReason || 'none',
+                encoder: r.encoderImplementation || '',
+                codec: codec?.mimeType || '',
+              })
+            );
+          });
+        } catch {}
+      }, 2000);
 
       pc.onconnectionstatechange = () => {
         console.log(`[HostWebRTC] ${sessionId} connection state: ${pc.connectionState}`);
@@ -832,6 +920,11 @@
     const peer = hostPeers.get(sessionId);
     if (!peer) return;
     stopHostFrameRelay(peer);
+    if (peer.statsTimer) {
+      clearInterval(peer.statsTimer);
+      peer.statsTimer = null;
+    }
+    swiftdesk.releaseUdpMappings(`host:${sessionId}`);
     if (peer.stream) {
       peer.stream.getTracks().forEach((t) => t.stop());
     }
@@ -1131,6 +1224,8 @@
         if (data.type === 'dc-pong' && data.ts) {
           currentPingMs = Math.max(1, Date.now() - data.ts);
           elStatPing.textContent = `${currentPingMs} ms`;
+        } else if (data.type === 'host-stats') {
+          lastHostStats = data;
         }
       } catch {}
     };
@@ -1145,23 +1240,28 @@
     clientHasWebRtcVideo = false;
     clientRemoteDescSet = false;
     clientPendingIce = [];
+    lastHostStats = null;
     elRemoteVideo.classList.remove('hidden');
     elRemoteCanvas.classList.add('hidden');
 
     const pc = new RTCPeerConnection(RTC_CONFIG);
     clientPc = pc;
+    if (clientNatOwner) swiftdesk.releaseUdpMappings(clientNatOwner);
+    const natOwner = `client:${generateUuid()}`;
+    clientNatOwner = natOwner;
 
     // Receive DataChannels created by Host
     pc.ondatachannel = (ev) => {
       bindClientDataChannel(ev.channel);
     };
 
+    const sendIce = (candidate: RTCIceCandidateInit) => {
+      if (pc === clientPc) sendClientSignaling({ type: 'webrtc-ice', candidate });
+    };
     pc.onicecandidate = (ev) => {
       if (ev.candidate) {
-        sendClientSignaling({
-          type: 'webrtc-ice',
-          candidate: ev.candidate.toJSON(),
-        });
+        sendIce(ev.candidate.toJSON());
+        advertiseUpnpCandidate(natOwner, ev.candidate, sendIce);
       }
     };
 
@@ -1236,6 +1336,7 @@
     elStatFps.textContent = '-- FPS';
     elStatPing.textContent = '-- ms';
     elStatRes.textContent = '--';
+    lastDiagnostics = '';
 
     elViewerDisplaySelect.innerHTML = '';
     if (displays && displays.length > 0) {
@@ -1267,34 +1368,70 @@
     lastStatsTime = performance.now();
 
     clientStatsTimer = window.setInterval(async () => {
+      const reports = new Map<string, any>();
+      if (clientPc) {
+        try {
+          (await clientPc.getStats()).forEach((r: any) => reports.set(r.id, r));
+        } catch {}
+      }
+      const iceSummary =
+        `ice=${clientPc?.iceConnectionState || 'none'} ` +
+        `local[${summarizeCandidates(reports, 'local-candidate')}] ` +
+        `remote[${summarizeCandidates(reports, 'remote-candidate')}]`;
+
       if (!clientHasWebRtcVideo) {
         if (relayFramesCount > 0) {
           elStatFps.textContent = `${relayFramesCount} FPS (Relay)`;
-          relayFramesCount = 0;
         }
+        lastDiagnostics = `path=Relay (P2P failed) fps=${relayFramesCount} ping=${currentPingMs}ms | ${iceSummary}`;
+        relayFramesCount = 0;
+        elViewerStats.title = `${lastDiagnostics}\n(Nhấn để sao chép thông tin chẩn đoán)`;
         return;
       }
-      if (!clientPc) return;
-      try {
-        const stats = await clientPc.getStats();
-        stats.forEach((report) => {
-          if (report.type === 'inbound-rtp' && report.kind === 'video') {
-            const now = performance.now();
-            const elapsedSec = Math.max(0.1, (now - lastStatsTime) / 1000);
-            const frames = report.framesDecoded || 0;
-            const fps = Math.round((frames - lastFramesDecoded) / elapsedSec);
-            lastFramesDecoded = frames;
-            lastStatsTime = now;
 
-            if (fps > 0 && fps <= 144) {
-              elStatFps.textContent = `${fps} FPS (P2P)`;
-            }
-            if (elRemoteVideo.videoWidth && elRemoteVideo.videoHeight) {
-              elStatRes.textContent = `${elRemoteVideo.videoWidth}x${elRemoteVideo.videoHeight}`;
-            }
-          }
-        });
-      } catch {}
+      let pair: any = null;
+      let inbound: any = null;
+      for (const r of reports.values()) {
+        if (r.type === 'transport' && r.selectedCandidatePairId) pair = reports.get(r.selectedCandidatePairId);
+        if (r.type === 'inbound-rtp' && r.kind === 'video') inbound = r;
+      }
+      if (!pair) {
+        pair = [...reports.values()].find((r) => r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded');
+      }
+      if (!inbound) return;
+      const pathLabel = describeIcePath(
+        pair ? reports.get(pair.localCandidateId) : null,
+        pair ? reports.get(pair.remoteCandidateId) : null
+      );
+
+      const now = performance.now();
+      const elapsedSec = Math.max(0.1, (now - lastStatsTime) / 1000);
+      const frames = inbound.framesDecoded || 0;
+      const fps = Math.round((frames - lastFramesDecoded) / elapsedSec);
+      lastFramesDecoded = frames;
+      lastStatsTime = now;
+
+      // ⚠ = the host's encoder is throttled by its CPU or by bandwidth, not by the network path
+      const hostLimited = !!lastHostStats && lastHostStats.limit !== 'none';
+      if (fps > 0 && fps <= 144) {
+        elStatFps.textContent = `${fps} FPS (${pathLabel})${hostLimited ? ' ⚠' : ''}`;
+      }
+      if (elRemoteVideo.videoWidth && elRemoteVideo.videoHeight) {
+        elStatRes.textContent = `${elRemoteVideo.videoWidth}x${elRemoteVideo.videoHeight}`;
+      }
+
+      const codec = inbound.codecId ? reports.get(inbound.codecId)?.mimeType || '' : '';
+      const h = lastHostStats;
+      lastDiagnostics =
+        `path=${pathLabel} fps=${fps} ping=${currentPingMs}ms ` +
+        `rtt=${Math.round((pair?.currentRoundTripTime || 0) * 1000)}ms ` +
+        `recv=${inbound.frameWidth || 0}x${inbound.frameHeight || 0} codec=${codec} ` +
+        `decoder=${inbound.decoderImplementation || '?'} lost=${inbound.packetsLost || 0} | ` +
+        (h
+          ? `host: ${h.fps}fps ${h.width}x${h.height} ${h.codec} encoder=${h.encoder} limit=${h.limit} | `
+          : 'host: ? | ') +
+        iceSummary;
+      elViewerStats.title = `${lastDiagnostics}\n(Nhấn để sao chép thông tin chẩn đoán)`;
     }, 1000);
   }
 
@@ -1338,6 +1475,10 @@
         clientPc.close();
       } catch {}
       clientPc = null;
+    }
+    if (clientNatOwner) {
+      swiftdesk.releaseUdpMappings(clientNatOwner);
+      clientNatOwner = '';
     }
     if (clientWs) {
       try {
@@ -1642,6 +1783,12 @@
     } else {
       showToast('Clipboard hiện tại đang trống', 'info');
     }
+  });
+
+  elViewerStats.addEventListener('click', async () => {
+    if (!lastDiagnostics) return;
+    await swiftdesk.writeClipboard(lastDiagnostics);
+    showToast('Đã sao chép thông tin chẩn đoán kết nối', 'success');
   });
 
   elBtnViewerAltTab.addEventListener('click', () => {
