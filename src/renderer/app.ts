@@ -75,9 +75,14 @@
     activeDisplayId: string;
     quality: 'ultra' | 'balanced' | 'low';
     frameRelayTimer: number | null;
-    awaitingFrameAck: boolean;
+    relayInFlight: number;
+    relayLastAckAt: number;
+    relayLastSentAt: number;
+    relayLastDataUrl: string;
+    relayFrameId: number;
     relayVideoEl: HTMLVideoElement | null;
     relayCanvas: HTMLCanvasElement | null;
+    lastPointerSeq: number;
   }
   const hostPeers = new Map<string, HostPeerSession>();
 
@@ -109,34 +114,40 @@
   let relayFramesCount = 0;
   let isOriginalScale = false;
 
-  // RTC Configuration with STUN + Public TURN Servers (UDP, TCP, TLS 443)
+  // RTC Configuration with STUN only. The free openrelay.metered.ca TURN no longer issues relay
+  // candidates; when P2P is impossible (symmetric NAT / CGNAT) the session falls back to frame relay.
   const RTC_CONFIG: RTCConfiguration = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
       { urls: 'stun:stun.cloudflare.com:3478' },
-      {
-        urls: [
-          'turn:openrelay.metered.ca:80',
-          'turn:openrelay.metered.ca:443',
-          'turn:openrelay.metered.ca:443?transport=tcp',
-        ],
-        username: 'openrelayproject',
-        credential: 'openrelayproject',
-      },
     ],
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
   };
 
   /**
+   * RTCSessionDescription / RTCIceCandidate expose their fields as prototype getters, so passing
+   * them through contextBridge / IPC yields an empty `{}`. Always convert to plain objects first!
+   */
+  function toPlainSdp(desc: RTCSessionDescription | null): RTCSessionDescriptionInit | null {
+    return desc ? { type: desc.type, sdp: desc.sdp } : null;
+  }
+
+  function isValidSdp(sdp: any): sdp is RTCSessionDescriptionInit {
+    return !!sdp && typeof sdp.type === 'string' && typeof sdp.sdp === 'string' && sdp.sdp.length > 0;
+  }
+
+  /**
    * Boosts WebRTC SDP video bitrate so Chromium immediately encodes at full sharpness
    * (12–25 Mbps start/max bitrate instead of WebRTC's default 300 kbps ramp-up).
+   * The sender reads these from the REMOTE description, so only the host applies it to the answer.
    */
   function boostSdpVideoBitrate(sdp: string, quality: 'ultra' | 'balanced' | 'low'): string {
     const startKbps = quality === 'ultra' ? 12000 : quality === 'balanced' ? 6000 : 2500;
     const maxKbps = quality === 'ultra' ? 25000 : quality === 'balanced' ? 10000 : 4000;
-    const minKbps = quality === 'ultra' ? 4000 : 1500;
+    // A high floor forces congestion + packet loss on slower links, which collapses FPS
+    const minKbps = quality === 'ultra' ? 1000 : quality === 'balanced' ? 600 : 300;
 
     return sdp
       .split('\r\n')
@@ -496,11 +507,45 @@
     });
 
     const videoTrack = stream.getVideoTracks()[0];
-    if (videoTrack && 'contentHint' in videoTrack) {
-      // 'detail' prevents WebRTC from downscaling desktop text/UI resolution
-      videoTrack.contentHint = 'detail';
+    if (videoTrack) {
+      applyContentHint(videoTrack, quality);
     }
     return stream;
+  }
+
+  /**
+   * Chromium (Electron 33) ignores RTCRtpSendParameters.degradationPreference, so contentHint is what
+   * decides what WebRTC sacrifices under CPU/bandwidth pressure:
+   * 'detail' keeps native resolution (drops FPS), 'motion' keeps FPS (drops resolution).
+   */
+  function applyContentHint(track: MediaStreamTrack, quality: 'ultra' | 'balanced' | 'low'): void {
+    if ('contentHint' in track) {
+      track.contentHint = quality === 'ultra' ? 'detail' : 'motion';
+    }
+  }
+
+  /**
+   * Prefer H.264 so the host encodes with the hardware encoder (VideoToolbox on macOS,
+   * MediaFoundation on Windows) instead of software VP8, which cannot sustain 1440p/4K at 60 FPS.
+   */
+  function preferHardwareFriendlyCodec(pc: RTCPeerConnection, sender: RTCRtpSender): void {
+    const transceiver = pc.getTransceivers().find((t) => t.sender === sender);
+    const capabilities = RTCRtpReceiver.getCapabilities('video');
+    if (!transceiver || !capabilities || typeof transceiver.setCodecPreferences !== 'function') return;
+
+    const rank = (codec: RTCRtpCodec): number => {
+      if (codec.mimeType.toLowerCase() !== 'video/h264') return 2;
+      return /packetization-mode=1/.test(codec.sdpFmtpLine || '') ? 0 : 1;
+    };
+    const sorted = capabilities.codecs
+      .map((codec, idx) => ({ codec, idx }))
+      .sort((a, b) => rank(a.codec) - rank(b.codec) || a.idx - b.idx)
+      .map((entry) => entry.codec);
+    try {
+      transceiver.setCodecPreferences(sorted);
+    } catch (err) {
+      console.warn('[HostWebRTC] Could not set codec preferences:', err);
+    }
   }
 
   async function tuneSenderEncoding(
@@ -519,8 +564,7 @@
       };
       params.encodings[0].maxBitrate = bitrateMap[quality] || 20_000_000;
       params.encodings[0].maxFramerate = quality === 'low' ? 30 : 60;
-      params.encodings[0].scaleResolutionDownBy = 1.0; // Lock 1:1 native resolution!
-      (params as any).degradationPreference = 'maintain-resolution';
+      params.encodings[0].scaleResolutionDownBy = 1.0; // Start at 1:1 native resolution
       await sender.setParameters(params);
     } catch (err) {
       console.warn('[HostWebRTC] Could not set sender encoding parameters:', err);
@@ -539,12 +583,24 @@
         }
         if (msg.type === 'input' && msg.event) {
           const peer = hostPeers.get(sessionId);
+          // 'input-fast' is unordered: drop a mousemove older than the last pointer event applied,
+          // otherwise a late packet yanks the cursor back to a stale position
+          if (peer && typeof msg.event.seq === 'number') {
+            if (msg.event.type === 'mousemove' && msg.event.seq <= peer.lastPointerSeq) return;
+            peer.lastPointerSeq = Math.max(peer.lastPointerSeq, msg.event.seq);
+          }
           msg.event.displayId = peer?.activeDisplayId || msg.event.displayId;
           swiftdesk.sendHostInputEvent(msg.event);
         }
       } catch {}
     };
   }
+
+  // Frame relay (used only when WebRTC P2P cannot connect) travels through the cloud broker, where
+  // a round trip costs ~0.5s. Keep a few frames in flight so FPS isn't capped at 1 / RTT.
+  const RELAY_MAX_IN_FLIGHT = 3;
+  const RELAY_ACK_TIMEOUT_MS = 1500;
+  const RELAY_REFRESH_MS = 1000;
 
   function startHostFrameRelayFallback(peer: HostPeerSession): void {
     if (peer.frameRelayTimer || !peer.stream) return;
@@ -560,11 +616,18 @@
 
     peer.relayVideoEl = video;
     peer.relayCanvas = canvas;
-    peer.awaitingFrameAck = false;
+    peer.relayInFlight = 0;
+    peer.relayLastAckAt = performance.now();
+    peer.relayLastDataUrl = '';
 
     peer.frameRelayTimer = window.setInterval(() => {
-      if (peer.awaitingFrameAck) return; // Flow-control: never queue up frames or lag ping!
       if (!video.videoWidth || !video.videoHeight || !ctx) return;
+      const now = performance.now();
+      if (peer.relayInFlight >= RELAY_MAX_IN_FLIGHT) {
+        // Flow-control: never queue up frames or lag ping, but recover if an ack was lost (QoS 0)
+        if (now - peer.relayLastAckAt < RELAY_ACK_TIMEOUT_MS) return;
+        peer.relayInFlight = 0;
+      }
 
       const targetW = peer.quality === 'low' ? 1280 : 1920;
       const scale = Math.min(1, targetW / video.videoWidth);
@@ -576,15 +639,35 @@
         canvas.height = h;
       }
       ctx.drawImage(video, 0, 0, w, h);
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
-      peer.awaitingFrameAck = true;
+      const jpegQuality = peer.quality === 'ultra' ? 0.7 : peer.quality === 'balanced' ? 0.6 : 0.5;
+      const dataUrl = canvas.toDataURL('image/jpeg', jpegQuality);
+
+      // Static screen: skip identical frames so bandwidth goes to frames that actually changed
+      if (dataUrl === peer.relayLastDataUrl && now - peer.relayLastSentAt < RELAY_REFRESH_MS) return;
+      peer.relayLastDataUrl = dataUrl;
+      peer.relayLastSentAt = now;
+      peer.relayInFlight++;
       swiftdesk.sendSignalToClient(peer.sessionId, {
         type: 'video-frame',
+        frameId: ++peer.relayFrameId,
         dataUrl,
         width: w,
         height: h,
       });
     }, 50);
+  }
+
+  function stopHostFrameRelay(peer: HostPeerSession): void {
+    if (peer.frameRelayTimer) {
+      clearInterval(peer.frameRelayTimer);
+      peer.frameRelayTimer = null;
+    }
+    if (peer.relayVideoEl) {
+      peer.relayVideoEl.srcObject = null;
+      peer.relayVideoEl = null;
+    }
+    peer.relayCanvas = null;
+    peer.relayLastDataUrl = '';
   }
 
   async function startHostWebRTCSession(data: {
@@ -619,13 +702,14 @@
         if (event.candidate) {
           swiftdesk.sendSignalToClient(sessionId, {
             type: 'webrtc-ice',
-            candidate: event.candidate,
+            candidate: event.candidate.toJSON(),
           });
         }
       };
 
       const videoTrack = stream.getVideoTracks()[0];
       const videoSender = pc.addTrack(videoTrack, stream);
+      preferHardwareFriendlyCodec(pc, videoSender);
       await tuneSenderEncoding(videoSender, quality);
 
       const peerSession: HostPeerSession = {
@@ -640,16 +724,21 @@
         activeDisplayId: displayId,
         quality,
         frameRelayTimer: null,
-        awaitingFrameAck: false,
+        relayInFlight: 0,
+        relayLastAckAt: 0,
+        relayLastSentAt: 0,
+        relayLastDataUrl: '',
+        relayFrameId: 0,
         relayVideoEl: null,
         relayCanvas: null,
+        lastPointerSeq: 0,
       };
       hostPeers.set(sessionId, peerSession);
 
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'connected' && peerSession.frameRelayTimer) {
-          clearInterval(peerSession.frameRelayTimer);
-          peerSession.frameRelayTimer = null;
+        console.log(`[HostWebRTC] ${sessionId} connection state: ${pc.connectionState}`);
+        if (pc.connectionState === 'connected') {
+          stopHostFrameRelay(peerSession);
         }
       };
 
@@ -657,12 +746,11 @@
         offerToReceiveAudio: false,
         offerToReceiveVideo: false,
       });
-      offer.sdp = boostSdpVideoBitrate(offer.sdp || '', quality);
       await pc.setLocalDescription(offer);
 
       swiftdesk.sendSignalToClient(sessionId, {
         type: 'webrtc-offer',
-        sdp: pc.localDescription,
+        sdp: toPlainSdp(pc.localDescription),
         displayId,
       });
     } catch (err) {
@@ -674,9 +762,20 @@
     const peer = hostPeers.get(msg.sessionId);
     if (!peer) return;
 
-    if (msg.type === 'webrtc-answer' && msg.sdp) {
-      msg.sdp.sdp = boostSdpVideoBitrate(msg.sdp.sdp || '', peer.quality);
-      await peer.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+    if (msg.type === 'webrtc-answer') {
+      if (!isValidSdp(msg.sdp)) {
+        console.error('[HostWebRTC] Received empty/invalid answer SDP:', msg.sdp);
+        return;
+      }
+      try {
+        await peer.pc.setRemoteDescription({
+          type: msg.sdp.type,
+          sdp: boostSdpVideoBitrate(msg.sdp.sdp || '', peer.quality),
+        });
+      } catch (err) {
+        console.error('[HostWebRTC] setRemoteDescription(answer) failed:', err);
+        return;
+      }
       peer.remoteDescSet = true;
       for (const cand of peer.pendingIce) {
         try {
@@ -693,7 +792,8 @@
         } catch {}
       }
     } else if (msg.type === 'frame-ack') {
-      peer.awaitingFrameAck = false;
+      peer.relayInFlight = Math.max(0, peer.relayInFlight - 1);
+      peer.relayLastAckAt = performance.now();
     } else if (msg.type === 'request-frame-relay') {
       startHostFrameRelayFallback(peer);
     } else if (msg.type === 'switch-display' && msg.sourceId) {
@@ -704,6 +804,7 @@
           await peer.videoSender.replaceTrack(newTrack);
           await tuneSenderEncoding(peer.videoSender, peer.quality);
         }
+        peer.relayLastDataUrl = '';
         if (peer.relayVideoEl) {
           peer.relayVideoEl.srcObject = newStream;
         }
@@ -717,6 +818,10 @@
       }
     } else if (msg.type === 'change-quality' && msg.quality) {
       peer.quality = msg.quality;
+      const track = peer.stream?.getVideoTracks()[0];
+      if (track) {
+        applyContentHint(track, msg.quality);
+      }
       if (peer.videoSender) {
         await tuneSenderEncoding(peer.videoSender, msg.quality);
       }
@@ -726,14 +831,7 @@
   function cleanupHostSession(sessionId: string): void {
     const peer = hostPeers.get(sessionId);
     if (!peer) return;
-    if (peer.frameRelayTimer) {
-      clearInterval(peer.frameRelayTimer);
-      peer.frameRelayTimer = null;
-    }
-    if (peer.relayVideoEl) {
-      peer.relayVideoEl.srcObject = null;
-      peer.relayVideoEl = null;
-    }
+    stopHostFrameRelay(peer);
     if (peer.stream) {
       peer.stream.getTracks().forEach((t) => t.stop());
     }
@@ -897,7 +995,7 @@
     }
 
     if (msg.type === 'video-frame' && msg.dataUrl) {
-      sendClientSignaling({ type: 'frame-ack' });
+      sendClientSignaling({ type: 'frame-ack', frameId: msg.frameId });
       if (!clientHasWebRtcVideo) {
         elViewerLoading.classList.add('hidden');
         elRemoteVideo.classList.add('hidden');
@@ -974,32 +1072,39 @@
       return;
     }
 
-    if (msg.type === 'webrtc-offer' && msg.sdp) {
+    if (msg.type === 'webrtc-offer') {
+      if (!isValidSdp(msg.sdp)) {
+        console.error('[ClientViewer] Received empty/invalid offer SDP:', msg.sdp);
+        return;
+      }
       if (!clientPc) {
         setupClientWebRTC();
       }
+      const pc = clientPc!;
       if (msg.displayId) {
         activeRemoteDisplayId = String(msg.displayId);
       }
-      msg.sdp.sdp = boostSdpVideoBitrate(msg.sdp.sdp || '', clientQuality);
-      await clientPc!.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-      clientRemoteDescSet = true;
+      try {
+        await pc.setRemoteDescription(msg.sdp);
+        clientRemoteDescSet = true;
 
-      // Flush any ICE candidates that arrived before setRemoteDescription
-      for (const cand of clientPendingIce) {
-        try {
-          await clientPc!.addIceCandidate(new RTCIceCandidate(cand));
-        } catch {}
+        // Flush any ICE candidates that arrived before setRemoteDescription
+        for (const cand of clientPendingIce) {
+          try {
+            await pc.addIceCandidate(cand);
+          } catch {}
+        }
+        clientPendingIce = [];
+
+        await pc.setLocalDescription(await pc.createAnswer());
+        sendClientSignaling({
+          type: 'webrtc-answer',
+          sdp: toPlainSdp(pc.localDescription),
+        });
+      } catch (err) {
+        console.error('[ClientViewer] WebRTC offer/answer failed:', err);
+        requestFrameRelayNow();
       }
-      clientPendingIce = [];
-
-      const answer = await clientPc!.createAnswer();
-      answer.sdp = boostSdpVideoBitrate(answer.sdp || '', clientQuality);
-      await clientPc!.setLocalDescription(answer);
-      sendClientSignaling({
-        type: 'webrtc-answer',
-        sdp: clientPc!.localDescription,
-      });
     } else if (msg.type === 'webrtc-ice' && msg.candidate) {
       if (!clientPc || !clientRemoteDescSet) {
         clientPendingIce.push(msg.candidate);
@@ -1055,8 +1160,18 @@
       if (ev.candidate) {
         sendClientSignaling({
           type: 'webrtc-ice',
-          candidate: ev.candidate,
+          candidate: ev.candidate.toJSON(),
         });
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc !== clientPc) return;
+      console.log(`[ClientViewer] WebRTC connection state: ${pc.connectionState}`);
+      if (pc.connectionState === 'failed') {
+        // P2P impossible (e.g. symmetric NAT without TURN) or dropped: switch to frame relay now
+        clientHasWebRtcVideo = false;
+        requestFrameRelayNow();
       }
     };
 
@@ -1090,10 +1205,21 @@
     // Only fall back to frame relay if WebRTC genuinely fails after 8 seconds
     if (clientWebRtcFallbackTimer) clearTimeout(clientWebRtcFallbackTimer);
     clientWebRtcFallbackTimer = window.setTimeout(() => {
-      if (!clientHasWebRtcVideo && !elViewerOverlay.classList.contains('hidden')) {
-        sendClientSignaling({ type: 'request-frame-relay' });
+      clientWebRtcFallbackTimer = null;
+      if (!clientHasWebRtcVideo) {
+        requestFrameRelayNow();
       }
     }, 8000);
+  }
+
+  function requestFrameRelayNow(): void {
+    if (clientWebRtcFallbackTimer) {
+      clearTimeout(clientWebRtcFallbackTimer);
+      clientWebRtcFallbackTimer = null;
+    }
+    if (!elViewerOverlay.classList.contains('hidden')) {
+      sendClientSignaling({ type: 'request-frame-relay' });
+    }
   }
 
   function openViewerOverlay(
@@ -1107,6 +1233,9 @@
     elViewerLoadingText.textContent = 'Đang thiết lập đường truyền P2P 60FPS độ phân giải gốc...';
     elViewerLoading.classList.remove('hidden');
     elViewerOverlay.classList.remove('hidden');
+    elStatFps.textContent = '-- FPS';
+    elStatPing.textContent = '-- ms';
+    elStatRes.textContent = '--';
 
     elViewerDisplaySelect.innerHTML = '';
     if (displays && displays.length > 0) {
@@ -1158,7 +1287,7 @@
             lastStatsTime = now;
 
             if (fps > 0 && fps <= 144) {
-              elStatFps.textContent = `${fps} FPS`;
+              elStatFps.textContent = `${fps} FPS (P2P)`;
             }
             if (elRemoteVideo.videoWidth && elRemoteVideo.videoHeight) {
               elStatRes.textContent = `${elRemoteVideo.videoWidth}x${elRemoteVideo.videoHeight}`;
@@ -1186,6 +1315,12 @@
       clearInterval(clientStatsTimer);
       clientStatsTimer = null;
     }
+    if (mouseSettleTimer) {
+      clearTimeout(mouseSettleTimer);
+      mouseSettleTimer = null;
+    }
+    pendingMouseMove = null;
+    stageButtonsDown.clear();
     if (clientFastChannel) {
       try {
         clientFastChannel.close();
@@ -1236,8 +1371,14 @@
     }
   }
 
+  let pointerSeq = 0;
+
   function sendRemoteInput(event: Record<string, unknown>, isFastMove = false): void {
     event.displayId = activeRemoteDisplayId;
+    if (event.type === 'mousemove' || event.type === 'mousedown' || event.type === 'mouseup') {
+      // Monotonic sequence lets the host drop moves reordered by the unordered 'input-fast' channel
+      event.seq = ++pointerSeq;
+    }
     const packet = JSON.stringify({ type: 'input', event });
 
     if (isFastMove && clientFastChannel && clientFastChannel.readyState === 'open') {
@@ -1303,39 +1444,64 @@
     };
   }
 
-  let pendingMouseMove: { x: number; y: number } | null = null;
-  let rafMouseScheduled = false;
-  let lastCloudMoveSent = 0;
+  // Cloud relay (no DataChannel) is slow, so mouse moves are capped at ~30/s there
+  const RELAY_MOUSE_INTERVAL_MS = 33;
+  // 'input-fast' may drop the last move, so the resting position is re-sent reliably once the mouse stops
+  const MOUSE_SETTLE_DELAY_MS = 80;
 
-  elViewerStage.addEventListener('mousemove', (e) => {
+  let pendingMouseMove: { x: number; y: number } | null = null;
+  let mouseFlushScheduled = false;
+  let lastMouseMoveSentAt = 0;
+  let lastMouseCoords = { x: 0.5, y: 0.5 };
+  let mouseSettleTimer: number | null = null;
+  const stageButtonsDown = new Set<number>();
+
+  function isInputChannelOpen(): boolean {
+    return (
+      clientFastChannel?.readyState === 'open' || clientReliableChannel?.readyState === 'open'
+    );
+  }
+
+  function flushMouseMove(): void {
+    mouseFlushScheduled = false;
+    if (!pendingMouseMove) return;
+
+    if (!isInputChannelOpen() && clientTransport === 'cloud') {
+      const waitMs = RELAY_MOUSE_INTERVAL_MS - (performance.now() - lastMouseMoveSentAt);
+      if (waitMs > 0) {
+        // Throttled: schedule a trailing send instead of dropping the move, otherwise the
+        // remote cursor stays behind wherever the last unthrottled move left it
+        mouseFlushScheduled = true;
+        window.setTimeout(flushMouseMove, waitMs);
+        return;
+      }
+    }
+
+    const coords = pendingMouseMove;
+    pendingMouseMove = null;
+    lastMouseMoveSentAt = performance.now();
+    sendRemoteInput({ type: 'mousemove', x: coords.x, y: coords.y }, true);
+
+    if (mouseSettleTimer) clearTimeout(mouseSettleTimer);
+    mouseSettleTimer = window.setTimeout(() => {
+      mouseSettleTimer = null;
+      if (clientFastChannel?.readyState === 'open') {
+        sendRemoteInput({ type: 'mousemove', x: coords.x, y: coords.y });
+      }
+    }, MOUSE_SETTLE_DELAY_MS);
+  }
+
+  window.addEventListener('mousemove', (e) => {
+    if (elViewerOverlay.classList.contains('hidden')) return;
+    // Outside the stage, keep tracking only while dragging with a button pressed on the stage
+    if (!elViewerStage.contains(e.target as Node) && stageButtonsDown.size === 0) return;
     const coords = getNormalizedVideoCoords(e.clientX, e.clientY);
     if (!coords) return;
+    lastMouseCoords = coords;
     pendingMouseMove = coords;
-    if (!rafMouseScheduled) {
-      rafMouseScheduled = true;
-      requestAnimationFrame(() => {
-        rafMouseScheduled = false;
-        if (!pendingMouseMove) return;
-
-        const dcOpen =
-          (clientFastChannel && clientFastChannel.readyState === 'open') ||
-          (clientReliableChannel && clientReliableChannel.readyState === 'open');
-        const now = performance.now();
-        if (!dcOpen && clientTransport === 'cloud' && now - lastCloudMoveSent < 40) {
-          return;
-        }
-        lastCloudMoveSent = now;
-
-        sendRemoteInput(
-          {
-            type: 'mousemove',
-            x: pendingMouseMove.x,
-            y: pendingMouseMove.y,
-          },
-          true
-        );
-        pendingMouseMove = null;
-      });
+    if (!mouseFlushScheduled) {
+      mouseFlushScheduled = true;
+      requestAnimationFrame(flushMouseMove);
     }
   });
 
@@ -1350,6 +1516,8 @@
     elViewerStage.focus();
     const coords = getNormalizedVideoCoords(e.clientX, e.clientY);
     if (!coords) return;
+    stageButtonsDown.add(e.button);
+    lastMouseCoords = coords;
     sendRemoteInput({
       type: 'mousedown',
       button: mapMouseButton(e.button),
@@ -1358,16 +1526,29 @@
     });
   });
 
-  elViewerStage.addEventListener('mouseup', (e) => {
+  // Listen on window so releasing the button outside the stage never leaves it stuck down remotely
+  window.addEventListener('mouseup', (e) => {
+    if (!stageButtonsDown.delete(e.button)) return;
     e.preventDefault();
-    const coords = getNormalizedVideoCoords(e.clientX, e.clientY);
-    if (!coords) return;
+    const coords = getNormalizedVideoCoords(e.clientX, e.clientY) || lastMouseCoords;
     sendRemoteInput({
       type: 'mouseup',
       button: mapMouseButton(e.button),
       x: coords.x,
       y: coords.y,
     });
+  });
+
+  window.addEventListener('blur', () => {
+    for (const btn of stageButtonsDown) {
+      sendRemoteInput({
+        type: 'mouseup',
+        button: mapMouseButton(btn),
+        x: lastMouseCoords.x,
+        y: lastMouseCoords.y,
+      });
+    }
+    stageButtonsDown.clear();
   });
 
   elViewerStage.addEventListener('contextmenu', (e) => {

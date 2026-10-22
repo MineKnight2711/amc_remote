@@ -63,6 +63,7 @@ export type RemoteInputEvent =
       x: number; // Normalized 0.0 -> 1.0 within active display
       y: number; // Normalized 0.0 -> 1.0 within active display
       displayId?: string;
+      seq?: number; // Monotonic pointer sequence, used to drop reordered DataChannel moves
     }
   | {
       type: 'mousedown' | 'mouseup';
@@ -70,6 +71,7 @@ export type RemoteInputEvent =
       x: number;
       y: number;
       displayId?: string;
+      seq?: number;
     }
   | {
       type: 'wheel';
