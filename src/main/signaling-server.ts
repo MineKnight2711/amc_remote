@@ -25,6 +25,8 @@ export function isDeviceIdFormat(input: string): boolean {
   return false;
 }
 
+const MAX_RELAY_BACKLOG_BYTES = 1_500_000;
+
 const CLOUD_BROKERS = [
   'mqtts://broker.emqx.io:8883',
   'wss://broker.emqx.io:8084/mqtt',
@@ -91,6 +93,8 @@ export class HostSignalingServer {
         connectTimeout: 5000,
         reconnectPeriod: 3000,
         keepalive: 30,
+        // Never buffer messages while offline: stale relay frames would pile up in memory
+        queueQoSZero: false,
       });
 
       this.mqttClient = client;
@@ -112,6 +116,7 @@ export class HostSignalingServer {
       });
 
       client.on('offline', () => {
+        console.warn(`[CloudID] Broker connection lost (${brokerUrl}), reconnecting...`);
         this.cloudConnected = false;
         this.notifyRenderer('app:cloud-status', { online: false, deviceId: this.store.get().deviceId });
       });
@@ -281,6 +286,12 @@ export class HostSignalingServer {
     }
   }
 
+  /** Bytes queued on the broker socket that the network hasn't accepted yet. */
+  private cloudBacklogBytes(): number {
+    const stream = (this.mqttClient as unknown as { stream?: { writableLength?: number } } | null)?.stream;
+    return stream?.writableLength || 0;
+  }
+
   public async start(port?: number): Promise<{ success: boolean; port: number; error?: string }> {
     const targetPort = port || this.store.get().listenPort || 9876;
     await this.stopLocalServer();
@@ -409,12 +420,24 @@ export class HostSignalingServer {
   }
 
   private sendToSession(session: ClientSession, payload: unknown): void {
+    // Relay frames are disposable: drop them when the link is backed up instead of buffering
+    // megabytes of JPEG (which also delays pings, signaling and input behind them)
+    const isVideoFrame = (payload as { type?: string })?.type === 'video-frame';
     if (session.transport === 'ws' && session.ws) {
       if (session.ws.readyState === WebSocket.OPEN) {
+        if (isVideoFrame && session.ws.bufferedAmount > MAX_RELAY_BACKLOG_BYTES) return;
         session.ws.send(JSON.stringify(payload));
       }
     } else if (session.transport === 'cloud' && session.replyTopic) {
+      if (isVideoFrame && this.cloudBacklogBytes() > MAX_RELAY_BACKLOG_BYTES) return;
       this.publishCloud(session.replyTopic, payload);
+    }
+  }
+
+  /** Ends every authenticated session (used when the host renderer dies). */
+  public disconnectAllSessions(): void {
+    for (const s of [...this.sessions.values()]) {
+      if (s.authenticated) this.disconnectSession(s.sessionId);
     }
   }
 

@@ -28,6 +28,26 @@ const kCGEventOtherMouseDown = 25;
 const kCGEventOtherMouseUp = 26;
 const kCGEventOtherMouseDragged = 27;
 const kCGScrollEventUnitPixel = 0;
+const kCGEventFlagMaskShift = 0x20000;
+const kCGEventFlagMaskControl = 0x40000;
+const kCGEventFlagMaskAlternate = 0x80000;
+const kCGEventFlagMaskCommand = 0x100000;
+
+interface ModifierState {
+  ctrlKey?: boolean;
+  shiftKey?: boolean;
+  altKey?: boolean;
+  metaKey?: boolean;
+}
+
+function macModifierFlags(m: ModifierState): number {
+  return (
+    (m.shiftKey ? kCGEventFlagMaskShift : 0) |
+    (m.ctrlKey ? kCGEventFlagMaskControl : 0) |
+    (m.altKey ? kCGEventFlagMaskAlternate : 0) |
+    (m.metaKey ? kCGEventFlagMaskCommand : 0)
+  );
+}
 
 // Extended keys on Windows that require KEYEVENTF_EXTENDEDKEY
 const WIN_EXTENDED_VKS = new Set([
@@ -95,9 +115,12 @@ export class InputController {
   private macCreateScrollEvent: ((source: null, units: number, wheelCount: number, wheel1: number, wheel2: number, wheel3: number) => unknown) | null = null;
   private macPostEvent: ((tap: number, ev: unknown) => void) | null = null;
   private macCFRelease: ((cf: unknown) => void) | null = null;
+  private macSetFlags: ((ev: unknown, flags: number) => void) | null = null;
 
   private lastMousePos = { x: 0, y: 0 };
   private buttonsDown = { left: false, middle: false, right: false };
+  // Keys currently held down remotely (code -> keyCode), released if the session ends mid-press
+  private keysDown = new Map<string, number>();
 
   constructor() {
     this.initNativeBindings();
@@ -136,6 +159,7 @@ export class InputController {
           'void* CGEventCreateScrollWheelEvent2(void* source, uint32_t units, uint32_t wheelCount, int32_t wheel1, int32_t wheel2, int32_t wheel3)'
         );
         this.macPostEvent = cg.func('void CGEventPost(uint32_t tap, void* event)');
+        this.macSetFlags = cg.func('void CGEventSetFlags(void* event, uint64_t flags)');
         this.macCFRelease = cf.func('void CFRelease(void* cf)');
         console.log('[InputController] Loaded ultra-low-latency macOS CoreGraphics FFI');
       }
@@ -201,7 +225,7 @@ export class InputController {
           const pt = this.resolveScreenCoordinates(event.x, event.y, event.displayId);
           this.lastMousePos = pt;
           this.moveMouse(pt.x, pt.y);
-          this.mouseButton(event.button, event.type === 'mousedown', pt.x, pt.y);
+          this.mouseButton(event.button, event.type === 'mousedown', pt.x, pt.y, event);
           break;
         }
         case 'wheel': {
@@ -210,7 +234,7 @@ export class InputController {
         }
         case 'keydown':
         case 'keyup': {
-          this.keyboardEvent(event.code, event.keyCode, event.type === 'keydown');
+          this.keyboardEvent(event.code, event.keyCode, event.type === 'keydown', event);
           break;
         }
         case 'special-combo': {
@@ -257,7 +281,8 @@ export class InputController {
     button: 'left' | 'middle' | 'right',
     isDown: boolean,
     x: number,
-    y: number
+    y: number,
+    modifiers?: ModifierState
   ): void {
     this.buttonsDown[button] = isDown;
 
@@ -285,6 +310,7 @@ export class InputController {
       }
       const ev = this.macCreateMouseEvent(null, type, { x, y }, btnIndex);
       if (ev) {
+        if (modifiers && this.macSetFlags) this.macSetFlags(ev, macModifierFlags(modifiers));
         this.macPostEvent(kCGHIDEventTap, ev);
         this.macCFRelease(ev);
       }
@@ -313,7 +339,10 @@ export class InputController {
     }
   }
 
-  private keyboardEvent(code: string, keyCode: number, isDown: boolean): void {
+  private keyboardEvent(code: string, keyCode: number, isDown: boolean, modifiers?: ModifierState): void {
+    if (isDown) this.keysDown.set(code, keyCode);
+    else this.keysDown.delete(code);
+
     if (process.platform === 'win32' && this.winKeybdEvent) {
       const vk = CODE_TO_WIN_VK[code] || keyCode;
       if (!vk) return;
@@ -325,9 +354,16 @@ export class InputController {
       this.winKeybdEvent(vk, scan, flags, 0);
     } else if (process.platform === 'darwin' && this.macCreateKeyboardEvent && this.macPostEvent && this.macCFRelease) {
       const macVk = CODE_TO_MAC_VK[code];
-      if (macVk === undefined) return;
+      if (macVk === undefined) {
+        console.warn(`[InputController] No macOS keycode for "${code}" (keyCode ${keyCode})`);
+        return;
+      }
       const ev = this.macCreateKeyboardEvent(null, macVk, isDown);
       if (ev) {
+        // Stamp the viewer's real modifier state on every event: otherwise a modifier whose keyup was
+        // lost (Win/Alt+Tab steal focus on the viewer) stays "held" in macOS, so every letter becomes
+        // a ⌘-shortcut and nothing can be typed (⌘Q even quits SwiftDesk itself)
+        if (modifiers && this.macSetFlags) this.macSetFlags(ev, macModifierFlags(modifiers));
         this.macPostEvent(kCGHIDEventTap, ev);
         this.macCFRelease(ev);
       }
@@ -335,7 +371,15 @@ export class InputController {
   }
 
   private triggerSpecialCombo(combo: string): void {
-    if (combo === 'alt-tab') {
+    if (combo === 'alt-tab' && process.platform === 'darwin') {
+      // The macOS app switcher is ⌘Tab
+      this.keyboardEvent('MetaLeft', 91, true, { metaKey: true });
+      this.keyboardEvent('Tab', 9, true, { metaKey: true });
+      setTimeout(() => {
+        this.keyboardEvent('Tab', 9, false, { metaKey: true });
+        this.keyboardEvent('MetaLeft', 91, false, {});
+      }, 60);
+    } else if (combo === 'alt-tab') {
       this.keyboardEvent('AltLeft', 18, true);
       this.keyboardEvent('Tab', 9, true);
       setTimeout(() => {
@@ -372,5 +416,13 @@ export class InputController {
     if (this.buttonsDown.left) this.mouseButton('left', false, this.lastMousePos.x, this.lastMousePos.y);
     if (this.buttonsDown.right) this.mouseButton('right', false, this.lastMousePos.x, this.lastMousePos.y);
     if (this.buttonsDown.middle) this.mouseButton('middle', false, this.lastMousePos.x, this.lastMousePos.y);
+    // A key left held after the session ends (e.g. ⌘) would keep hijacking the host's own keyboard
+    const held = [...this.keysDown.entries()];
+    if (held.length > 0) {
+      console.log(`[InputController] Releasing held keys: ${held.map(([code]) => code).join(', ')}`);
+    }
+    for (const [code, keyCode] of held) {
+      this.keyboardEvent(code, keyCode, false, {});
+    }
   }
 }

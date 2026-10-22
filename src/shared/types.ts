@@ -72,6 +72,10 @@ export type RemoteInputEvent =
       y: number;
       displayId?: string;
       seq?: number;
+      ctrlKey?: boolean;
+      shiftKey?: boolean;
+      altKey?: boolean;
+      metaKey?: boolean;
     }
   | {
       type: 'wheel';

@@ -15,6 +15,7 @@ import { InputController } from './input-controller';
 import { HostSignalingServer, isDeviceIdFormat } from './signaling-server';
 import { TrayManager } from './tray';
 import { UpnpPortMapper } from './upnp';
+import { initFileLogger, writeLine } from './logger';
 import { RemoteInputEvent, SavedDevice } from '../shared/types';
 
 // Set standalone App Name & Bundle ID for macOS TCC & Windows
@@ -92,6 +93,44 @@ function createMainWindow(): void {
   mainWindow.webContents.setWebRTCIPHandlingPolicy('default_public_and_private_interfaces');
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
 
+  // Renderer diagnostics ([HostWebRTC] / [ClientViewer] lines, warnings, errors) go to the log file too
+  mainWindow.webContents.on('console-message', (_e, level, message) => {
+    if (level >= 2 || message.startsWith('[')) {
+      writeLine(level >= 3 ? 'RENDERER-ERROR' : 'RENDERER', message);
+    }
+  });
+
+  // The host is usually unattended: if its renderer (capture + WebRTC) dies, end the sessions so
+  // viewers can reconnect, then reload instead of leaving a blank window
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    console.error(`[Main] Renderer process gone: reason=${details.reason} exitCode=${details.exitCode}`);
+    inputController?.releaseAllInputs();
+    signalingServer?.disconnectAllSessions();
+    if (details.reason !== 'clean-exit') {
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.reload();
+      }, 1000);
+    }
+  });
+
+  let unresponsiveTimer: NodeJS.Timeout | null = null;
+  mainWindow.on('unresponsive', () => {
+    console.warn('[Main] Renderer unresponsive');
+    if (unresponsiveTimer) return;
+    unresponsiveTimer = setTimeout(() => {
+      unresponsiveTimer = null;
+      console.error('[Main] Renderer hung for 15s, restarting it');
+      mainWindow?.webContents.forcefullyCrashRenderer();
+    }, 15000);
+  });
+  mainWindow.on('responsive', () => {
+    if (unresponsiveTimer) {
+      clearTimeout(unresponsiveTimer);
+      unresponsiveTimer = null;
+      console.log('[Main] Renderer responsive again');
+    }
+  });
+
   mainWindow.on('close', (e) => {
     if (!isQuitting && store.get().minimizeToTray) {
       e.preventDefault();
@@ -108,6 +147,10 @@ function registerIpcHandlers(): void {
   // Fast fire-and-forget IPC for WebRTC DataChannel input events
   ipcMain.on('host:input-event', (_event, inputEvent: RemoteInputEvent) => {
     inputController.handleEvent(inputEvent, store.get().allowClipboardSync);
+  });
+
+  ipcMain.on('host:release-inputs', () => {
+    inputController.releaseAllInputs();
   });
 
   // Host WebRTC signaling back to connected client (works for both WS and Cloud ID)
@@ -279,7 +322,15 @@ function registerIpcHandlers(): void {
   });
 }
 
+app.on('child-process-gone', (_e, details) => {
+  console.error(
+    `[Main] ${details.type} process gone: reason=${details.reason} exitCode=${details.exitCode} ${details.name || ''}`
+  );
+});
+
 app.whenReady().then(async () => {
+  const logPath = initFileLogger();
+  console.log(`[Main] Writing log to ${logPath}`);
   powerSaveId = powerSaveBlocker.start('prevent-app-suspension');
 
   session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
@@ -336,6 +387,7 @@ let quitCleanupDone = false;
 app.on('before-quit', (e) => {
   isQuitting = true;
   if (quitCleanupDone) return;
+  console.log('[Main] Quit requested (tray, ⌘Q / app menu, or system shutdown)');
   // Hold the quit until router port mappings are removed (some routers only support permanent leases)
   e.preventDefault();
   quitCleanupDone = true;

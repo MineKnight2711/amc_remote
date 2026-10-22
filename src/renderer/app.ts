@@ -636,6 +636,8 @@
   }
 
   function bindHostDataChannel(channel: RTCDataChannel, sessionId: string): void {
+    // Viewer vanished without a clean disconnect (network drop, crash): never leave keys held down
+    channel.onclose = () => swiftdesk.releaseHostInputs();
     channel.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data);
@@ -1436,6 +1438,8 @@
   }
 
   function disconnectClientViewer(notifyRemote = true): void {
+    // Must run while the channels are still open
+    releaseHeldRemoteInputs();
     if (clientConnectTimer) {
       clearTimeout(clientConnectTimer);
       clientConnectTimer = null;
@@ -1457,7 +1461,6 @@
       mouseSettleTimer = null;
     }
     pendingMouseMove = null;
-    stageButtonsDown.clear();
     if (clientFastChannel) {
       try {
         clientFastChannel.close();
@@ -1664,6 +1667,10 @@
       button: mapMouseButton(e.button),
       x: coords.x,
       y: coords.y,
+      ctrlKey: e.ctrlKey,
+      shiftKey: e.shiftKey,
+      altKey: e.altKey,
+      metaKey: e.metaKey,
     });
   });
 
@@ -1677,19 +1684,11 @@
       button: mapMouseButton(e.button),
       x: coords.x,
       y: coords.y,
+      ctrlKey: e.ctrlKey,
+      shiftKey: e.shiftKey,
+      altKey: e.altKey,
+      metaKey: e.metaKey,
     });
-  });
-
-  window.addEventListener('blur', () => {
-    for (const btn of stageButtonsDown) {
-      sendRemoteInput({
-        type: 'mouseup',
-        button: mapMouseButton(btn),
-        x: lastMouseCoords.x,
-        y: lastMouseCoords.y,
-      });
-    }
-    stageButtonsDown.clear();
   });
 
   elViewerStage.addEventListener('contextmenu', (e) => {
@@ -1709,10 +1708,15 @@
     { passive: false }
   );
 
+  // Keys held on the viewer; their keyup is never delivered if the OS steals focus mid-press
+  // (Win key opens Start, Alt+Tab, Ctrl+Alt+Del...), so they're released explicitly on blur
+  const pressedKeys = new Map<string, { key: string; keyCode: number }>();
+
   elViewerStage.addEventListener('keydown', (e) => {
     if (elViewerOverlay.classList.contains('hidden')) return;
     e.preventDefault();
     e.stopPropagation();
+    if (e.code) pressedKeys.set(e.code, { key: e.key, keyCode: e.keyCode });
 
     sendRemoteInput({
       type: 'keydown',
@@ -1730,6 +1734,7 @@
     if (elViewerOverlay.classList.contains('hidden')) return;
     e.preventDefault();
     e.stopPropagation();
+    pressedKeys.delete(e.code);
 
     sendRemoteInput({
       type: 'keyup',
@@ -1741,6 +1746,38 @@
       altKey: e.altKey,
       metaKey: e.metaKey,
     });
+  });
+
+  /** Release every key / mouse button still held remotely (focus lost, window hidden, disconnect). */
+  function releaseHeldRemoteInputs(): void {
+    for (const [code, k] of pressedKeys) {
+      sendRemoteInput({
+        type: 'keyup',
+        key: k.key,
+        code,
+        keyCode: k.keyCode,
+        ctrlKey: false,
+        shiftKey: false,
+        altKey: false,
+        metaKey: false,
+      });
+    }
+    pressedKeys.clear();
+    for (const btn of stageButtonsDown) {
+      sendRemoteInput({
+        type: 'mouseup',
+        button: mapMouseButton(btn),
+        x: lastMouseCoords.x,
+        y: lastMouseCoords.y,
+      });
+    }
+    stageButtonsDown.clear();
+  }
+
+  window.addEventListener('blur', releaseHeldRemoteInputs);
+  elViewerStage.addEventListener('blur', releaseHeldRemoteInputs);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) releaseHeldRemoteInputs();
   });
 
   // --- Viewer Toolbar Controls ---
