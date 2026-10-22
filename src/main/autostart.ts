@@ -10,7 +10,7 @@ const MAC_PLIST_ID = 'com.swiftdesk.remote';
 export class AutoStartManager {
   /**
    * Enables or disables automatic launch when Windows or macOS starts up.
-   * Supports both packaged (.exe / .app) and unpackaged Electron modes.
+   * Supports both packaged (.exe / SwiftDesk.app) and unpackaged Electron modes.
    */
   public static async setAutoStart(enable: boolean): Promise<boolean> {
     const execPath = process.execPath;
@@ -19,7 +19,6 @@ export class AutoStartManager {
     const args = isPackaged ? ['--autostart'] : [appPath, '--autostart'];
 
     try {
-      // 1. Standard Electron Login Item API (Windows & macOS)
       app.setLoginItemSettings({
         openAtLogin: enable,
         openAsHidden: true,
@@ -30,7 +29,6 @@ export class AutoStartManager {
       console.warn('Electron setLoginItemSettings warning:', err);
     }
 
-    // 2. OS-Specific explicit persistence (works reliably even in dev/portable builds)
     if (process.platform === 'win32') {
       await this.setWindowsRegistryAutoStart(enable, execPath, args);
     } else if (process.platform === 'darwin') {
@@ -91,7 +89,14 @@ export class AutoStartManager {
       }
 
       fs.mkdirSync(launchAgentsDir, { recursive: true });
-      const programArgsXml = [execPath, ...args]
+
+      // Detect if running inside SwiftDesk.app bundle
+      const appBundleMatch = execPath.match(/^(.+\.app)\/Contents\/MacOS\//);
+      const launchArgs = appBundleMatch
+        ? ['/usr/bin/open', '-a', appBundleMatch[1], '--args', '--autostart']
+        : [execPath, ...args];
+
+      const programArgsXml = launchArgs
         .map((arg) => `      <string>${this.escapeXml(arg)}</string>`)
         .join('\n');
 

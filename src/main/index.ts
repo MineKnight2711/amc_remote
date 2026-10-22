@@ -16,6 +16,12 @@ import { HostSignalingServer, isDeviceIdFormat } from './signaling-server';
 import { TrayManager } from './tray';
 import { RemoteInputEvent, SavedDevice } from '../shared/types';
 
+// Set standalone App Name & Bundle ID for macOS TCC & Windows
+app.setName('SwiftDesk');
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.swiftdesk.remote');
+}
+
 // --- Ultra-Low-Latency WebRTC & Background Streaming Flags ---
 app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
 app.commandLine.appendSwitch('enable-gpu-rasterization');

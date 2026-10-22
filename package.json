@@ -1,12 +1,12 @@
 {
   "name": "swiftdesk-remote",
-  "version": "1.0.0",
-  "description": "Ultra-low-latency Cross-Platform Remote Desktop (Windows & macOS) over Direct IP / Mesh VPN with WebRTC 60FPS, Auto-Start, and 1-Click Saved Devices",
+  "version": "1.1.0",
+  "description": "Ultra-low-latency Cross-Platform Remote Desktop (Windows & macOS) with Cloud ID & WebRTC 60FPS",
   "main": "dist/main/index.js",
   "scripts": {
     "build": "tsc && node scripts/copy-assets.js",
-    "start": "npm run build && electron .",
-    "dev": "npm run build && electron ."
+    "start": "npm run build && node scripts/start-app.js",
+    "dev": "npm run build && node scripts/start-app.js"
   },
   "keywords": [
     "remote-desktop",
@@ -14,14 +14,14 @@
     "electron",
     "windows",
     "macos",
-    "tailscale",
+    "cloud-id",
     "lan"
   ],
   "author": "SwiftDesk",
   "license": "MIT",
   "dependencies": {
     "koffi": "^2.9.0",
-    "mqtt": "^5.16.1",
+    "mqtt": "^5.15.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {
