@@ -110,11 +110,16 @@ if (process.platform !== 'darwin') {
     }
   }
 
+  // Stop any previously running instance of SwiftDesk.app so updated code is loaded cleanly
+  try {
+    execSync('pkill -f "SwiftDesk.app/Contents/MacOS" || true', { stdio: 'ignore' });
+  } catch {}
+
   console.log('[SwiftDesk macOS] Launching standalone SwiftDesk.app via macOS LaunchServices...');
   console.log(
     '[SwiftDesk macOS] Quyền Accessibility & Screen Recording sẽ được cấp riêng cho app "SwiftDesk" (không phải VS Code)!'
   );
 
   // Launch via `open -a` so macOS WindowServer/launchd owns the process, NOT VS Code!
-  execSync(`open -a "${swiftDeskApp}"`, { stdio: 'inherit' });
+  execSync(`open -n -a "${swiftDeskApp}"`, { stdio: 'inherit' });
 }
