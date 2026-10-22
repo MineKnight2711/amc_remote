@@ -62,15 +62,20 @@
   let currentPlatform = 'win32';
   let localNetworks: NetworkInterfaceInfo[] = [];
 
-  // Host WebRTC & Frame Relay Sessions (when other machines control this computer)
+  // Host WebRTC Sessions (when other machines control this computer)
   interface HostPeerSession {
     sessionId: string;
     pc: RTCPeerConnection;
     stream: MediaStream | null;
     videoSender: RTCRtpSender | null;
+    fastChannel: RTCDataChannel | null;
+    reliableChannel: RTCDataChannel | null;
+    pendingIce: RTCIceCandidateInit[];
+    remoteDescSet: boolean;
     activeDisplayId: string;
     quality: 'ultra' | 'balanced' | 'low';
     frameRelayTimer: number | null;
+    awaitingFrameAck: boolean;
     relayVideoEl: HTMLVideoElement | null;
     relayCanvas: HTMLCanvasElement | null;
   }
@@ -84,6 +89,8 @@
   let clientPc: RTCPeerConnection | null = null;
   let clientFastChannel: RTCDataChannel | null = null;
   let clientReliableChannel: RTCDataChannel | null = null;
+  let clientPendingIce: RTCIceCandidateInit[] = [];
+  let clientRemoteDescSet = false;
   let clientUsedPassword = '';
   let clientQuality: 'ultra' | 'balanced' | 'low' = 'ultra';
   let clientConnectTimer: number | null = null;
@@ -102,7 +109,7 @@
   let relayFramesCount = 0;
   let isOriginalScale = false;
 
-  // RTC Configuration with STUN + Public TURN Servers (UDP, TCP, TLS 443) for Cross-Network Internet P2P
+  // RTC Configuration with STUN + Public TURN Servers (UDP, TCP, TLS 443)
   const RTC_CONFIG: RTCConfiguration = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -121,6 +128,26 @@
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
   };
+
+  /**
+   * Boosts WebRTC SDP video bitrate so Chromium immediately encodes at full sharpness
+   * (12–25 Mbps start/max bitrate instead of WebRTC's default 300 kbps ramp-up).
+   */
+  function boostSdpVideoBitrate(sdp: string, quality: 'ultra' | 'balanced' | 'low'): string {
+    const startKbps = quality === 'ultra' ? 12000 : quality === 'balanced' ? 6000 : 2500;
+    const maxKbps = quality === 'ultra' ? 25000 : quality === 'balanced' ? 10000 : 4000;
+    const minKbps = quality === 'ultra' ? 4000 : 1500;
+
+    return sdp
+      .split('\r\n')
+      .map((line) => {
+        if (line.startsWith('a=fmtp:') && !line.includes('x-google-max-bitrate')) {
+          return `${line};x-google-min-bitrate=${minKbps};x-google-start-bitrate=${startKbps};x-google-max-bitrate=${maxKbps}`;
+        }
+        return line;
+      })
+      .join('\r\n');
+  }
 
   // --- DOM Elements ---
   const elCloudStatusText = document.getElementById('cloud-status-text')!;
@@ -302,7 +329,8 @@
         ? `● Online ${dev.latencyMs ? `(${dev.latencyMs}ms)` : ''}`
         : '○ Offline';
       const osShort = dev.platform === 'darwin' ? 'Mac' : dev.platform === 'win32' ? 'Win' : 'PC';
-      const isCloud = dev.connectionMode === 'cloud-id' || isCloudDeviceId(dev.ip) || isCloudDeviceId(dev.id);
+      const isCloud =
+        dev.connectionMode === 'cloud-id' || isCloudDeviceId(dev.ip) || isCloudDeviceId(dev.id);
       const addrDisplay = isCloud
         ? `Mã ID: ${dev.deviceId || dev.ip}`
         : `${dev.ip}:${dev.port}`;
@@ -442,7 +470,7 @@
   }
 
   // ============================================================================
-  // PART 1: HOST WEBRTC & FRAME STREAM ENGINE (Streams This Machine's Screen)
+  // PART 1: HOST WEBRTC 60FPS NATIVE RESOLUTION ENGINE
   // ============================================================================
 
   async function captureDisplayStream(
@@ -469,7 +497,8 @@
 
     const videoTrack = stream.getVideoTracks()[0];
     if (videoTrack && 'contentHint' in videoTrack) {
-      videoTrack.contentHint = 'motion';
+      // 'detail' prevents WebRTC from downscaling desktop text/UI resolution
+      videoTrack.contentHint = 'detail';
     }
     return stream;
   }
@@ -484,17 +513,37 @@
         params.encodings = [{}];
       }
       const bitrateMap = {
-        ultra: 12_000_000,
-        balanced: 5_500_000,
-        low: 2_200_000,
+        ultra: 25_000_000, // 25 Mbps for crystal-clear 2560x1440 / 4K at 60FPS
+        balanced: 10_000_000, // 10 Mbps
+        low: 3_500_000, // 3.5 Mbps
       };
-      params.encodings[0].maxBitrate = bitrateMap[quality] || 10_000_000;
+      params.encodings[0].maxBitrate = bitrateMap[quality] || 20_000_000;
       params.encodings[0].maxFramerate = quality === 'low' ? 30 : 60;
-      (params as any).degradationPreference = 'maintain-framerate';
+      params.encodings[0].scaleResolutionDownBy = 1.0; // Lock 1:1 native resolution!
+      (params as any).degradationPreference = 'maintain-resolution';
       await sender.setParameters(params);
     } catch (err) {
       console.warn('[HostWebRTC] Could not set sender encoding parameters:', err);
     }
+  }
+
+  function bindHostDataChannel(channel: RTCDataChannel, sessionId: string): void {
+    channel.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'dc-ping') {
+          if (channel.readyState === 'open') {
+            channel.send(JSON.stringify({ type: 'dc-pong', ts: msg.ts }));
+          }
+          return;
+        }
+        if (msg.type === 'input' && msg.event) {
+          const peer = hostPeers.get(sessionId);
+          msg.event.displayId = peer?.activeDisplayId || msg.event.displayId;
+          swiftdesk.sendHostInputEvent(msg.event);
+        }
+      } catch {}
+    };
   }
 
   function startHostFrameRelayFallback(peer: HostPeerSession): void {
@@ -511,11 +560,13 @@
 
     peer.relayVideoEl = video;
     peer.relayCanvas = canvas;
+    peer.awaitingFrameAck = false;
 
-    const intervalMs = peer.quality === 'low' ? 95 : 55; // ~18 FPS smooth relay over Cloud Broker
     peer.frameRelayTimer = window.setInterval(() => {
+      if (peer.awaitingFrameAck) return; // Flow-control: never queue up frames or lag ping!
       if (!video.videoWidth || !video.videoHeight || !ctx) return;
-      const targetW = peer.quality === 'low' ? 1152 : 1440;
+
+      const targetW = peer.quality === 'low' ? 1280 : 1920;
       const scale = Math.min(1, targetW / video.videoWidth);
       const w = Math.round(video.videoWidth * scale);
       const h = Math.round(video.videoHeight * scale);
@@ -525,14 +576,15 @@
         canvas.height = h;
       }
       ctx.drawImage(video, 0, 0, w, h);
-      const dataUrl = canvas.toDataURL('image/jpeg', peer.quality === 'low' ? 0.55 : 0.68);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+      peer.awaitingFrameAck = true;
       swiftdesk.sendSignalToClient(peer.sessionId, {
         type: 'video-frame',
         dataUrl,
         width: w,
         height: h,
       });
-    }, intervalMs);
+    }, 50);
   }
 
   async function startHostWebRTCSession(data: {
@@ -548,17 +600,19 @@
       const stream = await captureDisplayStream(sourceId, quality);
       const pc = new RTCPeerConnection(RTC_CONFIG);
 
+      // Host MUST create DataChannels BEFORE createOffer so SDP includes m=application SCTP!
+      const fastChannel = pc.createDataChannel('input-fast', {
+        ordered: false,
+        maxRetransmits: 0,
+      });
+      const reliableChannel = pc.createDataChannel('input-reliable', {
+        ordered: true,
+      });
+      bindHostDataChannel(fastChannel, sessionId);
+      bindHostDataChannel(reliableChannel, sessionId);
+
       pc.ondatachannel = (event) => {
-        const channel = event.channel;
-        channel.onmessage = (ev) => {
-          try {
-            const msg = JSON.parse(ev.data);
-            if (msg.type === 'input' && msg.event) {
-              msg.event.displayId = hostPeers.get(sessionId)?.activeDisplayId || displayId;
-              swiftdesk.sendHostInputEvent(msg.event);
-            }
-          } catch {}
-        };
+        bindHostDataChannel(event.channel, sessionId);
       };
 
       pc.onicecandidate = (event) => {
@@ -579,15 +633,19 @@
         pc,
         stream,
         videoSender,
+        fastChannel,
+        reliableChannel,
+        pendingIce: [],
+        remoteDescSet: false,
         activeDisplayId: displayId,
         quality,
         frameRelayTimer: null,
+        awaitingFrameAck: false,
         relayVideoEl: null,
         relayCanvas: null,
       };
       hostPeers.set(sessionId, peerSession);
 
-      // Stop frame relay automatically if WebRTC direct P2P/TURN connects!
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'connected' && peerSession.frameRelayTimer) {
           clearInterval(peerSession.frameRelayTimer);
@@ -599,6 +657,7 @@
         offerToReceiveAudio: false,
         offerToReceiveVideo: false,
       });
+      offer.sdp = boostSdpVideoBitrate(offer.sdp || '', quality);
       await pc.setLocalDescription(offer);
 
       swiftdesk.sendSignalToClient(sessionId, {
@@ -616,11 +675,25 @@
     if (!peer) return;
 
     if (msg.type === 'webrtc-answer' && msg.sdp) {
+      msg.sdp.sdp = boostSdpVideoBitrate(msg.sdp.sdp || '', peer.quality);
       await peer.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+      peer.remoteDescSet = true;
+      for (const cand of peer.pendingIce) {
+        try {
+          await peer.pc.addIceCandidate(new RTCIceCandidate(cand));
+        } catch {}
+      }
+      peer.pendingIce = [];
     } else if (msg.type === 'webrtc-ice' && msg.candidate) {
-      try {
-        await peer.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-      } catch {}
+      if (!peer.remoteDescSet) {
+        peer.pendingIce.push(msg.candidate);
+      } else {
+        try {
+          await peer.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        } catch {}
+      }
+    } else if (msg.type === 'frame-ack') {
+      peer.awaitingFrameAck = false;
     } else if (msg.type === 'request-frame-relay') {
       startHostFrameRelayFallback(peer);
     } else if (msg.type === 'switch-display' && msg.sourceId) {
@@ -629,6 +702,7 @@
         const newTrack = newStream.getVideoTracks()[0];
         if (peer.videoSender && newTrack) {
           await peer.videoSender.replaceTrack(newTrack);
+          await tuneSenderEncoding(peer.videoSender, peer.quality);
         }
         if (peer.relayVideoEl) {
           peer.relayVideoEl.srcObject = newStream;
@@ -681,9 +755,6 @@
     });
   }
 
-  /**
-   * Connects to a remote machine anywhere on the Internet using its 9-digit Cloud Device ID!
-   */
   function connectViaCloudId(options: {
     targetDeviceId: string;
     password?: string;
@@ -710,7 +781,7 @@
     const passwordToUse = options.password || existingSaved?.savedPassword || '';
     clientUsedPassword = passwordToUse;
 
-    elConnectStatusMsg.textContent = `Đang tìm thiết bị Mã ID ${formattedId} qua Internet...`;
+    elConnectStatusMsg.textContent = `Đang kết nối tới Mã ID ${formattedId}...`;
     elBtnConnectNow.disabled = true;
 
     swiftdesk.startClientCloudSession(clientSessionId);
@@ -718,7 +789,7 @@
     if (clientConnectTimer) clearTimeout(clientConnectTimer);
     clientConnectTimer = window.setTimeout(() => {
       elBtnConnectNow.disabled = false;
-      elConnectStatusMsg.textContent = `Không tìm thấy thiết bị ${formattedId}. Hãy chắc chắn máy đích đang mở SwiftDesk và có kết nối Internet.`;
+      elConnectStatusMsg.textContent = `Không tìm thấy thiết bị ${formattedId}. Hãy chắc chắn máy đích đang mở SwiftDesk.`;
       showToast(`Thiết bị ${formattedId} hiện không phản hồi`, 'error');
       swiftdesk.stopClientCloudSession(clientTargetDeviceId, clientSessionId);
     }, 7500);
@@ -735,9 +806,6 @@
     });
   }
 
-  /**
-   * Connects to a remote machine via Direct IP:Port (LAN or VPN).
-   */
   function connectViaDirectIp(options: {
     ip: string;
     port: number;
@@ -771,7 +839,7 @@
       if (ws.readyState !== WebSocket.OPEN) {
         ws.close();
         elBtnConnectNow.disabled = false;
-        elConnectStatusMsg.textContent = `Không thể kết nối tới ${ip}:${port}. Bạn có thể nhập Mã ID 9 số của máy đích để kết nối qua Internet.`;
+        elConnectStatusMsg.textContent = `Không thể kết nối tới ${ip}:${port}. Bạn có thể nhập Mã ID 9 số của máy đích.`;
         showToast(`Không phản hồi từ ${ip}:${port}`, 'error');
       }
     }, 6000);
@@ -829,7 +897,7 @@
     }
 
     if (msg.type === 'video-frame' && msg.dataUrl) {
-      // Fallback frame relay rendering when strict firewall blocks UDP WebRTC
+      sendClientSignaling({ type: 'frame-ack' });
       if (!clientHasWebRtcVideo) {
         elViewerLoading.classList.add('hidden');
         elRemoteVideo.classList.add('hidden');
@@ -874,50 +942,93 @@
       elConnectStatusMsg.textContent = '';
 
       const hostInfo = msg.hostInfo || {};
+
+      // CRITICAL: Initialize WebRTC synchronously BEFORE any async await so we NEVER miss webrtc-offer!
+      openViewerOverlay(hostInfo, msg.displays || [], clientQuality);
+      setupClientWebRTC();
+      sendClientSignaling({ type: 'client-webrtc-ready' });
+
+      // Save device asynchronously in background
       const isCloud = clientTransport === 'cloud';
       const savedId = isCloud
         ? hostInfo.deviceId || clientTargetDeviceId
         : hostInfo.deviceId || `${activeRemoteIp}:${activeRemotePort}`;
 
-      const updatedSaved = await swiftdesk.upsertSavedDevice({
-        id: savedId,
-        deviceId: hostInfo.deviceId || (isCloud ? clientTargetDeviceId : undefined),
-        name: hostInfo.deviceName || activeRemoteIp,
-        ip: isCloud ? hostInfo.deviceId || clientTargetDeviceId : activeRemoteIp,
-        port: isCloud ? hostInfo.port || 9876 : activeRemotePort,
-        connectionMode: isCloud ? 'cloud-id' : 'direct-ip',
-        platform: hostInfo.platform || 'unknown',
-        trustToken: msg.trustToken || '',
-        savedPassword: clientUsedPassword || undefined,
-        online: true,
-      });
-      currentConfig.savedDevices = updatedSaved;
-      renderSavedDevices(updatedSaved);
-
-      openViewerOverlay(hostInfo, msg.displays || [], clientQuality);
-      setupClientWebRTC();
+      swiftdesk
+        .upsertSavedDevice({
+          id: savedId,
+          deviceId: hostInfo.deviceId || (isCloud ? clientTargetDeviceId : undefined),
+          name: hostInfo.deviceName || activeRemoteIp,
+          ip: isCloud ? hostInfo.deviceId || clientTargetDeviceId : activeRemoteIp,
+          port: isCloud ? hostInfo.port || 9876 : activeRemotePort,
+          connectionMode: isCloud ? 'cloud-id' : 'direct-ip',
+          platform: hostInfo.platform || 'unknown',
+          trustToken: msg.trustToken || '',
+          savedPassword: clientUsedPassword || undefined,
+          online: true,
+        })
+        .then((updatedSaved: SavedDevice[]) => {
+          currentConfig.savedDevices = updatedSaved;
+          renderSavedDevices(updatedSaved);
+        });
       return;
     }
 
-    if (msg.type === 'webrtc-offer' && msg.sdp && clientPc) {
+    if (msg.type === 'webrtc-offer' && msg.sdp) {
+      if (!clientPc) {
+        setupClientWebRTC();
+      }
       if (msg.displayId) {
         activeRemoteDisplayId = String(msg.displayId);
       }
-      await clientPc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-      const answer = await clientPc.createAnswer();
-      await clientPc.setLocalDescription(answer);
+      msg.sdp.sdp = boostSdpVideoBitrate(msg.sdp.sdp || '', clientQuality);
+      await clientPc!.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+      clientRemoteDescSet = true;
+
+      // Flush any ICE candidates that arrived before setRemoteDescription
+      for (const cand of clientPendingIce) {
+        try {
+          await clientPc!.addIceCandidate(new RTCIceCandidate(cand));
+        } catch {}
+      }
+      clientPendingIce = [];
+
+      const answer = await clientPc!.createAnswer();
+      answer.sdp = boostSdpVideoBitrate(answer.sdp || '', clientQuality);
+      await clientPc!.setLocalDescription(answer);
       sendClientSignaling({
         type: 'webrtc-answer',
-        sdp: clientPc.localDescription,
+        sdp: clientPc!.localDescription,
       });
-    } else if (msg.type === 'webrtc-ice' && msg.candidate && clientPc) {
-      try {
-        await clientPc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-      } catch {}
+    } else if (msg.type === 'webrtc-ice' && msg.candidate) {
+      if (!clientPc || !clientRemoteDescSet) {
+        clientPendingIce.push(msg.candidate);
+      } else {
+        try {
+          await clientPc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        } catch {}
+      }
     } else if (msg.type === 'session-closed') {
       showToast(msg.reason || 'Máy chủ đã đóng kết nối', 'info');
       disconnectClientViewer(false);
     }
+  }
+
+  function bindClientDataChannel(ch: RTCDataChannel): void {
+    if (ch.label === 'input-fast') {
+      clientFastChannel = ch;
+    } else if (ch.label === 'input-reliable') {
+      clientReliableChannel = ch;
+    }
+    ch.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        if (data.type === 'dc-pong' && data.ts) {
+          currentPingMs = Math.max(1, Date.now() - data.ts);
+          elStatPing.textContent = `${currentPingMs} ms`;
+        }
+      } catch {}
+    };
   }
 
   function setupClientWebRTC(): void {
@@ -927,20 +1038,18 @@
       } catch {}
     }
     clientHasWebRtcVideo = false;
+    clientRemoteDescSet = false;
+    clientPendingIce = [];
     elRemoteVideo.classList.remove('hidden');
     elRemoteCanvas.classList.add('hidden');
 
     const pc = new RTCPeerConnection(RTC_CONFIG);
     clientPc = pc;
 
-    clientFastChannel = pc.createDataChannel('input-fast', {
-      ordered: false,
-      maxRetransmits: 0,
-    });
-
-    clientReliableChannel = pc.createDataChannel('input-reliable', {
-      ordered: true,
-    });
+    // Receive DataChannels created by Host
+    pc.ondatachannel = (ev) => {
+      bindClientDataChannel(ev.channel);
+    };
 
     pc.onicecandidate = (ev) => {
       if (ev.candidate) {
@@ -961,23 +1070,30 @@
       if (ev.streams && ev.streams[0]) {
         elRemoteVideo.srcObject = ev.streams[0];
         elRemoteVideo.play().catch(() => {});
-        elRemoteVideo.onloadeddata = () => {
+        elRemoteVideo.onloadedmetadata = () => {
           clientHasWebRtcVideo = true;
+          if (clientWebRtcFallbackTimer) {
+            clearTimeout(clientWebRtcFallbackTimer);
+            clientWebRtcFallbackTimer = null;
+          }
           elRemoteCanvas.classList.add('hidden');
           elRemoteVideo.classList.remove('hidden');
           elViewerLoading.classList.add('hidden');
           elViewerStage.focus();
+          if (elRemoteVideo.videoWidth && elRemoteVideo.videoHeight) {
+            elStatRes.textContent = `${elRemoteVideo.videoWidth}x${elRemoteVideo.videoHeight}`;
+          }
         };
       }
     };
 
-    // If WebRTC UDP/TURN takes > 2.6s across strict NATs, automatically request Cloud Frame Relay so screen still shows immediately!
+    // Only fall back to frame relay if WebRTC genuinely fails after 8 seconds
     if (clientWebRtcFallbackTimer) clearTimeout(clientWebRtcFallbackTimer);
     clientWebRtcFallbackTimer = window.setTimeout(() => {
       if (!clientHasWebRtcVideo && !elViewerOverlay.classList.contains('hidden')) {
         sendClientSignaling({ type: 'request-frame-relay' });
       }
-    }, 2600);
+    }, 8000);
   }
 
   function openViewerOverlay(
@@ -988,7 +1104,7 @@
     elViewerHostName.textContent = hostInfo.deviceName || activeRemoteTargetLabel;
     elViewerHostIp.textContent = activeRemoteTargetLabel;
     elViewerQualitySelect.value = quality;
-    elViewerLoadingText.textContent = 'Đang đồng bộ hình ảnh màn hình từ xa...';
+    elViewerLoadingText.textContent = 'Đang thiết lập đường truyền P2P 60FPS độ phân giải gốc...';
     elViewerLoading.classList.remove('hidden');
     elViewerOverlay.classList.remove('hidden');
 
@@ -1008,8 +1124,13 @@
 
     if (clientPingTimer) clearInterval(clientPingTimer);
     clientPingTimer = window.setInterval(() => {
-      sendClientSignaling({ type: 'ping', ts: Date.now() });
-    }, 1800);
+      // Measure real P2P latency over WebRTC DataChannel when open!
+      if (clientReliableChannel && clientReliableChannel.readyState === 'open') {
+        clientReliableChannel.send(JSON.stringify({ type: 'dc-ping', ts: Date.now() }));
+      } else {
+        sendClientSignaling({ type: 'ping', ts: Date.now() });
+      }
+    }, 1500);
 
     if (clientStatsTimer) clearInterval(clientStatsTimer);
     lastFramesDecoded = 0;
@@ -1196,10 +1317,11 @@
         rafMouseScheduled = false;
         if (!pendingMouseMove) return;
 
-        // If DataChannel isn't open yet and using Cloud signaling, cap mousemove rate to ~30Hz
-        const dcOpen = clientFastChannel && clientFastChannel.readyState === 'open';
+        const dcOpen =
+          (clientFastChannel && clientFastChannel.readyState === 'open') ||
+          (clientReliableChannel && clientReliableChannel.readyState === 'open');
         const now = performance.now();
-        if (!dcOpen && clientTransport === 'cloud' && now - lastCloudMoveSent < 32) {
+        if (!dcOpen && clientTransport === 'cloud' && now - lastCloudMoveSent < 40) {
           return;
         }
         lastCloudMoveSent = now;
@@ -1313,11 +1435,12 @@
   });
 
   elViewerQualitySelect.addEventListener('change', () => {
+    clientQuality = elViewerQualitySelect.value as 'ultra' | 'balanced' | 'low';
     sendClientSignaling({
       type: 'change-quality',
-      quality: elViewerQualitySelect.value,
+      quality: clientQuality,
     });
-    showToast(`Đã chuyển chế độ truyền hình ảnh sang ${elViewerQualitySelect.value.toUpperCase()}`, 'info');
+    showToast(`Đã chuyển chế độ truyền hình ảnh sang ${clientQuality.toUpperCase()}`, 'info');
   });
 
   elBtnViewerScale.addEventListener('click', () => {

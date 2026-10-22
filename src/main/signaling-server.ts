@@ -5,6 +5,7 @@ import * as mqtt from 'mqtt';
 import { BrowserWindow, desktopCapturer, screen } from 'electron';
 import { ConfigStore } from './store';
 import { InputController } from './input-controller';
+import { getLocalNetworkInterfaces } from './network';
 import {
   ActiveSessionInfo,
   DisplaySourceInfo,
@@ -18,7 +19,6 @@ export function normalizeDeviceId(raw: string): string {
 
 export function isDeviceIdFormat(input: string): boolean {
   const trimmed = input.trim();
-  // Matches XXX-XXX-XXX, XXX XXX XXX, or 9 digits
   if (/^\d{3}[-\s]?\d{3}[-\s]?\d{3}$/.test(trimmed)) {
     return true;
   }
@@ -38,6 +38,10 @@ interface ClientSession {
   replyTopic?: string;
   remoteIp: string;
   authenticated: boolean;
+  webrtcStarted: boolean;
+  quality: 'ultra' | 'balanced' | 'low';
+  primarySourceId?: string;
+  primaryDisplayId?: string;
   controllerId: string;
   controllerName: string;
   platform: string;
@@ -56,7 +60,6 @@ export class HostSignalingServer {
   private sessions = new Map<string, ClientSession>();
   private currentPort = 0;
 
-  // Client-side Cloud Session subscriptions (when THIS machine controls another machine via ID)
   private activeClientSubTopic: string | null = null;
   private pendingProbes = new Map<
     string,
@@ -95,7 +98,11 @@ export class HostSignalingServer {
       client.on('connect', () => {
         this.cloudConnected = true;
         const hostInboxTopic = `swiftdesk/v2/host/${cleanHostId}/in`;
-        client.subscribe([hostInboxTopic, this.clientProbeTopic], { qos: 0 });
+        const topics = [hostInboxTopic, this.clientProbeTopic];
+        if (this.activeClientSubTopic) {
+          topics.push(this.activeClientSubTopic);
+        }
+        client.subscribe(topics, { qos: 0 });
         console.log(`[CloudID] Connected to Cloud Broker (${brokerUrl}) with ID: ${this.store.get().deviceId}`);
         this.notifyRenderer('app:cloud-status', { online: true, deviceId: this.store.get().deviceId });
       });
@@ -110,7 +117,7 @@ export class HostSignalingServer {
       });
 
       client.on('error', (err) => {
-        console.warn('[CloudID] Broker error, trying fallback if needed:', err.message);
+        console.warn('[CloudID] Broker error:', err.message);
       });
     } catch (err) {
       console.error('[CloudID] Failed to init MQTT:', err);
@@ -125,7 +132,6 @@ export class HostSignalingServer {
       return;
     }
 
-    // 1. Response to a ping probe we sent for a Saved Device
     if (topic === this.clientProbeTopic && msg.type === 'ping-probe-reply' && msg.probeId) {
       const pending = this.pendingProbes.get(msg.probeId);
       if (pending) {
@@ -139,17 +145,14 @@ export class HostSignalingServer {
       return;
     }
 
-    // 2. Message arriving for our active Client Viewer (controlling a remote machine via ID)
     if (this.activeClientSubTopic && topic === this.activeClientSubTopic) {
       this.notifyRenderer('client:cloud-message', msg);
       return;
     }
 
-    // 3. Message arriving at THIS Host's Inbox (`swiftdesk/v2/host/<ID>/in`)
     const cleanHostId = normalizeDeviceId(this.store.get().deviceId);
     const hostInboxTopic = `swiftdesk/v2/host/${cleanHostId}/in`;
     if (topic === hostInboxTopic) {
-      // Handle lightweight online status probe
       if (msg.type === 'ping-probe' && msg.replyTopic && msg.probeId) {
         const cfg = this.store.get();
         this.publishCloud(msg.replyTopic, {
@@ -160,7 +163,7 @@ export class HostSignalingServer {
             deviceName: cfg.deviceName,
             platform: process.platform,
             port: this.currentPort,
-            version: '1.1.0',
+            version: '1.2.0',
           },
         });
         return;
@@ -177,6 +180,8 @@ export class HostSignalingServer {
           replyTopic: `swiftdesk/v2/client/${sessionId}/in`,
           remoteIp: `ID: ${msg.controllerId || 'Internet P2P'}`,
           authenticated: false,
+          webrtcStarted: false,
+          quality: msg.quality || 'ultra',
           controllerId: '',
           controllerName: 'Remote Device',
           platform: 'unknown',
@@ -204,9 +209,6 @@ export class HostSignalingServer {
     }
   }
 
-  /**
-   * Probes whether a remote Host ID (XXX-XXX-XXX) is online via Cloud Broker.
-   */
   public probeCloudDeviceId(
     targetDeviceId: string,
     timeoutMs = 2200
@@ -244,9 +246,6 @@ export class HostSignalingServer {
     });
   }
 
-  /**
-   * Used by the Client Renderer to initiate or send messages over a Cloud ID session.
-   */
   public startClientCloudSession(sessionId: string): void {
     if (this.activeClientSubTopic && this.mqttClient) {
       this.mqttClient.unsubscribe(this.activeClientSubTopic);
@@ -296,7 +295,7 @@ export class HostSignalingServer {
             deviceName: cfg.deviceName,
             platform: process.platform,
             port: this.currentPort || targetPort,
-            version: '1.1.0',
+            version: '1.2.0',
           };
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(info));
@@ -457,6 +456,8 @@ export class HostSignalingServer {
       ws,
       remoteIp: rawIp,
       authenticated: false,
+      webrtcStarted: false,
+      quality: 'ultra',
       controllerId: '',
       controllerName: 'Unknown Device',
       platform: 'unknown',
@@ -475,7 +476,7 @@ export class HostSignalingServer {
         deviceName: cfg.deviceName,
         platform: process.platform,
         port: this.currentPort,
-        version: '1.1.0',
+        version: '1.2.0',
       },
     });
 
@@ -500,6 +501,18 @@ export class HostSignalingServer {
 
     ws.on('error', () => {
       this.sessions.delete(sessionId);
+    });
+  }
+
+  private triggerHostWebRTCIfNeeded(session: ClientSession): void {
+    if (session.webrtcStarted) return;
+    session.webrtcStarted = true;
+    this.notifyRenderer('host:start-webrtc', {
+      sessionId: session.sessionId,
+      sourceId: session.primarySourceId,
+      displayId: session.primaryDisplayId,
+      quality: session.quality,
+      transport: session.transport,
     });
   }
 
@@ -546,16 +559,19 @@ export class HostSignalingServer {
       }
 
       const issuedTrustToken = this.store.issueTrustToken(controllerId, controllerName, platform);
+      const displays = await this.getDisplaySources();
+      const primaryDisplay = displays.find((d) => d.isPrimary) || displays[0];
+      const cfg = this.store.get();
 
       session.authenticated = true;
       session.controllerId = controllerId;
       session.controllerName = controllerName;
       session.platform = platform;
       session.authMethod = authMethod;
+      session.quality = quality;
+      session.primarySourceId = primaryDisplay?.id;
+      session.primaryDisplayId = primaryDisplay?.displayId;
       session.connectedAt = Date.now();
-
-      const displays = await this.getDisplaySources();
-      const cfg = this.store.get();
 
       this.sendToSession(session, {
         type: 'auth-success',
@@ -566,25 +582,29 @@ export class HostSignalingServer {
           deviceName: cfg.deviceName,
           platform: process.platform,
           port: this.currentPort,
-          version: '1.1.0',
+          version: '1.2.0',
         },
+        localIps: getLocalNetworkInterfaces().map((n) => n.address),
         displays,
       });
 
       this.notifySessionsUpdated();
 
-      const primaryDisplay = displays.find((d) => d.isPrimary) || displays[0];
-      this.notifyRenderer('host:start-webrtc', {
-        sessionId: session.sessionId,
-        sourceId: primaryDisplay?.id,
-        displayId: primaryDisplay?.displayId,
-        quality,
-        transport: session.transport,
-      });
+      // Safety fallback if client-webrtc-ready takes > 600ms
+      setTimeout(() => {
+        if (this.sessions.has(session.sessionId)) {
+          this.triggerHostWebRTCIfNeeded(session);
+        }
+      }, 600);
       return;
     }
 
     if (!session.authenticated) {
+      return;
+    }
+
+    if (msg.type === 'client-webrtc-ready') {
+      this.triggerHostWebRTCIfNeeded(session);
       return;
     }
 
@@ -602,7 +622,8 @@ export class HostSignalingServer {
       case 'webrtc-ice':
       case 'switch-display':
       case 'change-quality':
-      case 'request-frame-relay': {
+      case 'request-frame-relay':
+      case 'frame-ack': {
         this.notifyRenderer('host:signal-from-client', {
           sessionId: session.sessionId,
           ...msg,
