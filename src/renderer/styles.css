@@ -941,3 +941,47 @@ body {
 .toast.error {
   border-left-color: var(--accent-red);
 }
+
+
+/* Prominent Cloud ID Card */
+.cloud-id-card {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.18) 0%, rgba(37, 99, 235, 0.2) 100%);
+  border: 1px solid rgba(16, 185, 129, 0.45);
+  border-radius: var(--radius-md);
+  padding: 14px 16px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.cloud-id-card:hover {
+  border-color: #34d399;
+  box-shadow: 0 4px 18px rgba(16, 185, 129, 0.18);
+}
+
+.cloud-id-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.cloud-id-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: #34d399;
+  letter-spacing: 0.4px;
+}
+
+.cloud-id-value {
+  font-family: var(--font-mono);
+  font-size: 27px;
+  font-weight: 800;
+  letter-spacing: 2px;
+  color: #ffffff;
+  margin: 6px 0 4px 0;
+  user-select: text;
+}
+
+.cloud-id-sub {
+  font-size: 12px;
+  color: #d1d5db;
+}

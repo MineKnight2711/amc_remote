@@ -1,60 +1,47 @@
-# SwiftDesk — Remote Desktop 60FPS (Windows & macOS)
+# SwiftDesk — Remote Desktop 60FPS Qua Mã ID & IP (Windows & macOS)
 
-Ứng dụng điều khiển máy tính từ xa 2 chiều tốc độ cao được xây dựng bằng **Electron + TypeScript + WebRTC P2P Hardware Acceleration** kết hợp với **Native C FFI (`koffi` -> `user32.dll` trên Windows & `CoreGraphics/Quartz` trên macOS)** cho độ trễ thao tác chuột/phím dưới `0.1ms`.
+Ứng dụng điều khiển máy tính từ xa 2 chiều tốc độ cao được xây dựng bằng **Electron + TypeScript + Cloud ID Signaling + WebRTC P2P/TURN Hardware Acceleration** kết hợp với **Native C FFI (`koffi` -> `user32.dll` trên Windows & `CoreGraphics/Quartz` trên macOS)** cho độ trễ thao tác chuột/phím dưới `0.1ms`.
 
 ---
 
 ## ✨ Tính năng nổi bật
 
-1. **Khởi động tự động cùng Windows & macOS**:
+1. **Kết nối xuyên mạng Internet bằng Mã ID 9 số (`XXX-XXX-XXX` — Không cần cài VPN/Tailscale)**:
+   - Mỗi máy được cấp một **Mã ID 9 số cố định** (ví dụ: `482-910-375`).
+   - Chỉ cần nhập **Mã ID 9 số** + **Mật khẩu** của máy đích là kết nối điều khiển được từ **bất kỳ mạng Internet nào** (khác Wi-Fi, khác thành phố, 4G) mà không cần cài Tailscale hay mở Port Modem.
+   - Tích hợp sẵn **WebRTC P2P + STUN/TURN Relay** cùng chế độ **Cloud Frame Stream Fallback** tự động khi gặp tường lửa chặn UDP.
+2. **Khởi động tự động cùng Windows & macOS**:
    - Tự động đăng ký vào **Windows Registry (`HKCU\...\Run`)**, **macOS LaunchAgents (`~/Library/LaunchAgents`)** và Login Items của hệ điều hành.
    - Chạy ngầm ở **System Tray (Khay hệ thống / Menu Bar)** ngay khi mở máy, luôn sẵn sàng nhận kết nối 24/7.
-2. **Điều khiển qua Internet & Nội bộ (Direct IP / Mesh VPN)**:
-   - Tự động nhận diện địa chỉ IP từ **Tailscale (`100.x.x.x`)**, **ZeroTier**, **WireGuard**, **Radmin VPN** cũng như mạng **LAN / Wi-Fi**.
-   - Tắt cơ chế ẩn IP mDNS của Chromium (`WebRtcHideLocalIpsWithMdns`) để thiết lập đường truyền P2P trực tiếp giữa 2 thiết bị qua VPN/LAN trong `< 50ms`.
 3. **Cài đặt mật khẩu & Lưu thiết bị kết nối 1-Chạm**:
-   - Mỗi máy có mật khẩu bảo vệ cố định (có thể tự đặt hoặc tạo ngẫu nhiên).
-   - **Lưu máy sau lần kết nối đầu tiên**: Khi bạn nhập đúng mật khẩu ở lần kết nối đầu tiên, máy chủ sẽ cấp một **Trusted Device Token** (lưu bảo mật bằng `SHA-256`).
+   - Khi bạn nhập đúng mật khẩu ở lần kết nối đầu tiên, máy chủ sẽ cấp một **Trusted Device Token** (lưu bảo mật bằng `SHA-256`).
    - Từ lần thứ 2 trở đi, chỉ cần nhấn **⚡ Kết nối ngay** tại mục **Thiết bị đã lưu** mà không cần nhập lại mật khẩu.
-   - Tự động ping kiểm tra trạng thái **Online / Offline** và độ trễ (`ms`) của các máy đã lưu.
-4. **Tốc độ 60 FPS & Phản hồi tức thì**:
-   - Luồng hình ảnh WebRTC 60 FPS với `contentHint = 'motion'`, `degradationPreference = 'maintain-framerate'`, bitrate lên tới `12 Mbps`.
-   - Bộ nhận hình ảnh loại bỏ hoàn toàn độ trễ bộ đệm (`playoutDelayHint = 0`, `jitterBufferTarget = 0`).
-   - Giữ nguyên tốc độ 60 FPS ngay cả khi cửa sổ máy chủ đang thu nhỏ dưới System Tray (`backgroundThrottling: false`).
-   - Điều khiển chuột truyền qua kênh UDP `RTCDataChannel` (`ordered: false, maxRetransmits: 0`) đồng bộ theo `requestAnimationFrame`.
+   - Tự động kiểm tra trạng thái **Online / Offline** và độ trễ (`ms`) của các máy đã lưu qua Cloud ID và LAN.
 
 ---
 
-## 🚀 Cách chạy dự án
+## 🚀 Cách chạy và cập nhật trên Windows & macOS
 
-### 1. Cài đặt thư viện
+### Nếu mới tải lần đầu:
 ```bash
+git clone https://github.com/MineKnight2711/amc_remote.git
+cd amc_remote
 npm install
+npm start
 ```
 
-### 2. Biên dịch và khởi chạy ứng dụng
+### Nếu đã clone trước đó (Cập nhật bản mới nhất):
 ```bash
+git pull origin main
+npm install
 npm start
 ```
 
 ---
 
-## 🌐 Hướng dẫn kết nối giữa 2 máy (Windows ↔ macOS) qua Internet
+## 🌐 Cách kết nối giữa 2 máy (Windows ↔ macOS)
 
-1. **Cài đặt Mesh VPN miễn phí (Khuyên dùng Tailscale hoặc ZeroTier)** trên cả 2 máy:
-   - Tải [Tailscale](https://tailscale.com/) trên máy Windows và macOS, đăng nhập cùng 1 tài khoản.
-2. **Mở SwiftDesk trên cả 2 máy**:
-   - Ở cột bên trái (**Máy tính của bạn**), ứng dụng sẽ tự động hiển thị địa chỉ IP **Tailscale Mesh VPN** (ví dụ: `100.85.12.34:9876`) và **Mật khẩu cố định**.
-3. **Kết nối lần đầu**:
-   - Trên máy điều khiển, nhập `100.85.12.34:9876` và mật khẩu của máy đích, nhấn **Kết nối & Điều khiển ngay**.
-4. **Kết nối các lần sau (1-Chạm)**:
-   - Máy đích đã được lưu vào danh sách **Thiết bị đã lưu (Kết nối 1-Chạm)** kèm trạng thái `● Online`. Bạn chỉ cần bấm **⚡ Kết nối ngay** để vào thẳng màn hình từ xa.
-
----
-
-## 🍎 Lưu ý quyền hệ thống trên macOS
-
-Khi chạy trên macOS, để cho phép điều khiển chuột/bàn phím và quay màn hình, hãy vào:
-- **System Settings → Privacy & Security → Accessibility**: Bật quyền cho SwiftDesk / Electron.
-- **System Settings → Privacy & Security → Screen Recording**: Bật quyền cho SwiftDesk / Electron.
-*(Trong giao diện ứng dụng trên macOS cũng có nút **Kiểm tra & Cấp quyền** để mở nhanh cửa sổ cấp quyền).*
+1. Mở ứng dụng trên cả 2 máy.
+2. Ở cột bên trái (**Máy tính của bạn**), xem ô **🌐 MÃ ID KẾT NỐI QUA INTERNET** (dạng `XXX-XXX-XXX`) và **Mật khẩu cố định**.
+3. Trên máy điều khiển, nhập **Mã ID 9 số** đó (ví dụ: `482-910-375`) và **Mật khẩu** vào ô **Điều khiển thiết bị khác** → Nhấn **Kết nối & Điều khiển ngay**.
+4. Từ lần sau, máy đó sẽ nằm sẵn trong mục **Thiết bị đã lưu (Kết nối 1-Chạm)** — chỉ cần nhấn **⚡ Kết nối ngay** là vào thẳng màn hình từ xa.

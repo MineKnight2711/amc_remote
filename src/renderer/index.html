@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SwiftDesk — Điều Khiển Máy Tính Từ Xa Tốc Độ Cao</title>
+  <title>SwiftDesk — Điều Khiển Máy Tính Từ Xa Qua Mã ID &amp; IP</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -20,15 +20,15 @@
           </svg>
         </div>
         <div>
-          <div class="brand-title">SwiftDesk <span class="badge-pro">60FPS WebRTC</span></div>
-          <div class="brand-subtitle">Điều khiển nội bộ &amp; Internet P2P (Windows &amp; macOS)</div>
+          <div class="brand-title">SwiftDesk <span class="badge-pro">Cloud ID &amp; 60FPS P2P</span></div>
+          <div class="brand-subtitle">Điều khiển xuyên mạng Internet bằng Mã ID (Không cần VPN) hoặc IP LAN</div>
         </div>
       </div>
 
       <div class="topbar-status">
-        <div class="status-pill online" id="service-status-pill">
-          <span class="status-dot"></span>
-          <span id="service-status-text">Sẵn sàng nhận kết nối (Port 9876)</span>
+        <div class="status-pill online" id="cloud-status-pill">
+          <span class="status-dot" id="cloud-status-dot"></span>
+          <span id="cloud-status-text">🌐 Cloud ID Sẵn sàng (Mọi mạng)</span>
         </div>
         <div class="status-pill" id="os-badge-pill">
           <span id="os-badge-text">Windows</span>
@@ -44,13 +44,13 @@
       <button id="btn-mac-permissions" class="btn btn-sm btn-warning">Kiểm tra &amp; Cấp quyền</button>
     </div>
 
-    <!-- Active Incoming Session Banner (Shown when someone is controlling this computer) -->
+    <!-- Active Incoming Session Banner -->
     <div id="incoming-session-banner" class="incoming-banner hidden">
       <div class="incoming-info">
         <span class="pulse-ring"></span>
         <div>
           <strong id="incoming-title">Đang có thiết bị điều khiển máy của bạn</strong>
-          <div id="incoming-subtitle" class="incoming-sub">IP: 100.x.x.x — Đã xác thực bảo mật</div>
+          <div id="incoming-subtitle" class="incoming-sub">Đã xác thực bảo mật</div>
         </div>
       </div>
       <div id="incoming-session-actions" class="incoming-actions"></div>
@@ -63,34 +63,19 @@
         <div class="panel-header">
           <div>
             <h2>Máy tính của bạn (Host)</h2>
-            <p class="panel-desc">Chia sẻ IP và mật khẩu dưới đây để máy khác điều khiển máy này</p>
-          </div>
-          <button id="btn-refresh-net" class="btn btn-icon" title="Làm mới danh sách IP mạng">
-            ↻ Làm mới IP
-          </button>
-        </div>
-
-        <!-- Device ID & Hostname Card -->
-        <div class="info-box">
-          <div class="info-row">
-            <div>
-              <span class="label-muted">Tên thiết bị</span>
-              <div class="value-lg" id="host-device-name">Đang tải...</div>
-            </div>
-            <div class="text-right">
-              <span class="label-muted">Cổng kết nối (Port)</span>
-              <div class="value-mono" id="host-port-display">9876</div>
-            </div>
+            <p class="panel-desc">Dùng <strong>Mã ID</strong> dưới đây để điều khiển máy này từ bất kỳ mạng Internet nào</p>
           </div>
         </div>
 
-        <!-- Network IP Addresses (VPN / Tailscale / ZeroTier / LAN) -->
-        <div class="section-block">
-          <div class="section-label-row">
-            <span class="section-label">Địa chỉ IP kết nối (Click để sao chép IP:Port)</span>
+        <!-- Prominent Cloud Device ID Card (No VPN Needed!) -->
+        <div class="cloud-id-card" id="btn-copy-cloud-id" title="Nhấn để sao chép Mã ID của máy này">
+          <div class="cloud-id-top">
+            <span class="cloud-id-label">🌐 MÃ ID KẾT NỐI QUA INTERNET (KHÔNG CẦN VPN)</span>
+            <span class="copy-tag">Sao chép ID</span>
           </div>
-          <div id="network-list" class="network-list">
-            <!-- Populated dynamically -->
+          <div class="cloud-id-value" id="host-cloud-id">--- --- ---</div>
+          <div class="cloud-id-sub">
+            Tên máy: <strong id="host-device-name">Đang tải...</strong> • Port LAN: <span id="host-port-display">9876</span>
           </div>
         </div>
 
@@ -110,11 +95,24 @@
             />
             <button id="btn-toggle-pass" class="btn btn-ghost" title="Hiện / Ẩn mật khẩu">Hiện</button>
             <button id="btn-random-pass" class="btn btn-ghost" title="Tạo mật khẩu ngẫu nhiên">Ngẫu nhiên</button>
-            <button id="btn-save-pass" class="btn btn-primary">Lưu mật khẩu</button>
+            <button id="btn-save-pass" class="btn btn-primary">Lưu</button>
           </div>
           <p class="help-text">
-            Khi máy khác nhập đúng mật khẩu này ở lần đầu tiên, máy sẽ được cấp mã tin cậy để các lần sau kết nối 1-chạm không cần nhập lại.
+            Nhập đúng mật khẩu này ở lần kết nối đầu tiên, thiết bị sẽ được lưu để các lần sau kết nối 1-chạm không cần nhập lại.
           </p>
+        </div>
+
+        <!-- Local LAN IP Addresses (Optional for same Wi-Fi) -->
+        <div class="section-block">
+          <div class="section-label-row">
+            <span class="section-label">Địa chỉ IP nội bộ (Tùy chọn khi chung mạng LAN)</span>
+            <button id="btn-refresh-net" class="btn btn-icon" title="Làm mới danh sách IP mạng">
+              ↻ Làm mới
+            </button>
+          </div>
+          <div id="network-list" class="network-list">
+            <!-- Populated dynamically -->
+          </div>
         </div>
 
         <!-- Startup & System Settings -->
@@ -167,20 +165,22 @@
         <div class="connect-card">
           <div class="panel-header">
             <div>
-              <h2>Điều khiển thiết bị khác</h2>
-              <p class="panel-desc">Nhập IP (LAN, Tailscale, ZeroTier hoặc WAN IP) của máy cần điều khiển</p>
+              <h2>Điều khiển thiết bị khác (Qua Mã ID hoặc IP)</h2>
+              <p class="panel-desc">
+                Nhập <strong>Mã ID 9 số</strong> (VD: <code>482-910-375</code>) để kết nối qua Internet không cần VPN, hoặc nhập IP LAN
+              </p>
             </div>
           </div>
 
           <form id="connect-form" class="connect-form">
             <div class="connect-inputs-row">
               <div class="form-field flex-2">
-                <label for="remote-ip-input">Địa chỉ IP hoặc IP:Port máy đích</label>
+                <label for="remote-ip-input">Mã ID máy đích (hoặc IP:Port)</label>
                 <input
                   type="text"
                   id="remote-ip-input"
                   class="input-control mono-input input-lg"
-                  placeholder="VD: 100.85.12.34 hoặc 192.168.1.50:9876"
+                  placeholder="VD: 482-910-375 (hoặc 192.168.1.50)"
                   required
                 />
               </div>
@@ -220,7 +220,7 @@
             <div>
               <h2>Thiết bị đã lưu (Kết nối 1-Chạm)</h2>
               <p class="panel-desc">
-                Các máy đã kết nối thành công 1 lần sẽ tự động lưu tại đây — nhấn <strong>Kết nối ngay</strong> không cần nhập lại mật khẩu
+                Các máy đã kết nối 1 lần sẽ tự động lưu Mã ID tại đây — nhấn <strong>⚡ Kết nối ngay</strong> không cần nhập lại mật khẩu
               </p>
             </div>
             <button id="btn-ping-saved" class="btn btn-icon" title="Kiểm tra trạng thái Online của các máy đã lưu">
@@ -233,7 +233,7 @@
           </div>
         </div>
 
-        <!-- Trusted Controllers Section (Machines allowed to control this PC) -->
+        <!-- Trusted Controllers Section -->
         <div class="trusted-section">
           <div class="section-label-row">
             <span class="section-label">Thiết bị đã được cấp quyền điều khiển máy này</span>
@@ -251,9 +251,9 @@
     <!-- Floating Top Control Bar -->
     <div id="viewer-toolbar" class="viewer-toolbar">
       <div class="viewer-peer-info">
-        <span class="live-badge">● LIVE 60FPS</span>
+        <span class="live-badge">● LIVE</span>
         <strong id="viewer-host-name">Remote PC</strong>
-        <span id="viewer-host-ip" class="viewer-ip-tag">100.x.x.x</span>
+        <span id="viewer-host-ip" class="viewer-ip-tag">ID: ---</span>
       </div>
 
       <div class="viewer-stats" id="viewer-stats">
@@ -301,12 +301,13 @@
       </div>
     </div>
 
-    <!-- Video Canvas Container -->
+    <!-- Video & Fallback Canvas Stage -->
     <div id="viewer-stage" class="viewer-stage" tabindex="0">
       <video id="remote-video" class="remote-video" autoplay playsinline muted></video>
+      <canvas id="remote-canvas" class="remote-video hidden"></canvas>
       <div id="viewer-loading" class="viewer-loading">
         <div class="spinner"></div>
-        <div id="viewer-loading-text">Đang thiết lập kênh truyền hình ảnh 60FPS độ trễ thấp...</div>
+        <div id="viewer-loading-text">Đang kết nối tới thiết bị từ xa...</div>
       </div>
     </div>
   </div>

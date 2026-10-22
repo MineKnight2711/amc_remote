@@ -92,7 +92,7 @@ export class InputController {
 
   private macCreateMouseEvent: ((source: null, type: number, pos: { x: number; y: number }, btn: number) => unknown) | null = null;
   private macCreateKeyboardEvent: ((source: null, vk: number, keyDown: boolean) => unknown) | null = null;
-  private macCreateScrollEvent: ((source: null, units: number, wheelCount: number, wheel1: number, wheel2: number) => unknown) | null = null;
+  private macCreateScrollEvent: ((source: null, units: number, wheelCount: number, wheel1: number, wheel2: number, wheel3: number) => unknown) | null = null;
   private macPostEvent: ((tap: number, ev: unknown) => void) | null = null;
   private macCFRelease: ((cf: unknown) => void) | null = null;
 
@@ -133,7 +133,7 @@ export class InputController {
           'void* CGEventCreateKeyboardEvent(void* source, uint16_t virtualKey, bool keyDown)'
         );
         this.macCreateScrollEvent = cg.func(
-          'void* CGEventCreateScrollWheelEvent(void* source, uint32_t units, uint32_t wheelCount, int32_t wheel1, int32_t wheel2)'
+          'void* CGEventCreateScrollWheelEvent2(void* source, uint32_t units, uint32_t wheelCount, int32_t wheel1, int32_t wheel2, int32_t wheel3)'
         );
         this.macPostEvent = cg.func('void CGEventPost(uint32_t tap, void* event)');
         this.macCFRelease = cf.func('void CFRelease(void* cf)');
@@ -305,7 +305,7 @@ export class InputController {
     } else if (process.platform === 'darwin' && this.macCreateScrollEvent && this.macPostEvent && this.macCFRelease) {
       const macY = Math.round(-deltaY);
       const macX = Math.round(-deltaX);
-      const ev = this.macCreateScrollEvent(null, kCGScrollEventUnitPixel, 2, macY, macX);
+      const ev = this.macCreateScrollEvent(null, kCGScrollEventUnitPixel, 2, macY, macX, 0);
       if (ev) {
         this.macPostEvent(kCGHIDEventTap, ev);
         this.macCFRelease(ev);
@@ -346,7 +346,6 @@ export class InputController {
       this.keyboardEvent('MetaLeft', 91, true);
       setTimeout(() => this.keyboardEvent('MetaLeft', 91, false), 60);
     } else if (combo === 'task-manager') {
-      // Ctrl + Shift + Esc on Windows, Cmd + Option + Esc on macOS
       if (process.platform === 'win32') {
         this.keyboardEvent('ControlLeft', 17, true);
         this.keyboardEvent('ShiftLeft', 16, true);

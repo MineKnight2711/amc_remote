@@ -1,6 +1,7 @@
 import * as http from 'http';
 import * as crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
+import * as mqtt from 'mqtt';
 import { BrowserWindow, desktopCapturer, screen } from 'electron';
 import { ConfigStore } from './store';
 import { InputController } from './input-controller';
@@ -11,9 +12,30 @@ import {
   RemoteInputEvent,
 } from '../shared/types';
 
+export function normalizeDeviceId(raw: string): string {
+  return String(raw || '').replace(/[^0-9a-zA-Z]/g, '').toUpperCase();
+}
+
+export function isDeviceIdFormat(input: string): boolean {
+  const trimmed = input.trim();
+  // Matches XXX-XXX-XXX, XXX XXX XXX, or 9 digits
+  if (/^\d{3}[-\s]?\d{3}[-\s]?\d{3}$/.test(trimmed)) {
+    return true;
+  }
+  return false;
+}
+
+const CLOUD_BROKERS = [
+  'mqtts://broker.emqx.io:8883',
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+];
+
 interface ClientSession {
   sessionId: string;
-  ws: WebSocket;
+  transport: 'ws' | 'cloud';
+  ws?: WebSocket;
+  replyTopic?: string;
   remoteIp: string;
   authenticated: boolean;
   controllerId: string;
@@ -21,24 +43,248 @@ interface ClientSession {
   platform: string;
   authMethod: 'password' | 'trust-token';
   connectedAt: number;
+  lastSeenAt: number;
 }
 
 export class HostSignalingServer {
   private httpServer: http.Server | null = null;
   private wss: WebSocketServer | null = null;
+  private mqttClient: mqtt.MqttClient | null = null;
+  private cloudConnected = false;
+  private brokerIndex = 0;
+
   private sessions = new Map<string, ClientSession>();
   private currentPort = 0;
+
+  // Client-side Cloud Session subscriptions (when THIS machine controls another machine via ID)
+  private activeClientSubTopic: string | null = null;
+  private pendingProbes = new Map<
+    string,
+    { start: number; resolve: (res: { online: boolean; latencyMs?: number; info?: HostPublicInfo }) => void }
+  >();
+  private clientProbeTopic = `swiftdesk/v2/probe/${crypto.randomUUID()}`;
 
   constructor(
     private store: ConfigStore,
     private inputController: InputController,
     private getMainWindow: () => BrowserWindow | null,
     private onSessionStateChange?: () => void
-  ) {}
+  ) {
+    this.initCloudBroker();
+  }
+
+  public isCloudOnline(): boolean {
+    return this.cloudConnected;
+  }
+
+  private initCloudBroker(): void {
+    const brokerUrl = CLOUD_BROKERS[this.brokerIndex % CLOUD_BROKERS.length];
+    const cleanHostId = normalizeDeviceId(this.store.get().deviceId);
+
+    try {
+      const client = mqtt.connect(brokerUrl, {
+        clientId: `swiftdesk_${cleanHostId}_${crypto.randomBytes(4).toString('hex')}`,
+        clean: true,
+        connectTimeout: 5000,
+        reconnectPeriod: 3000,
+        keepalive: 30,
+      });
+
+      this.mqttClient = client;
+
+      client.on('connect', () => {
+        this.cloudConnected = true;
+        const hostInboxTopic = `swiftdesk/v2/host/${cleanHostId}/in`;
+        client.subscribe([hostInboxTopic, this.clientProbeTopic], { qos: 0 });
+        console.log(`[CloudID] Connected to Cloud Broker (${brokerUrl}) with ID: ${this.store.get().deviceId}`);
+        this.notifyRenderer('app:cloud-status', { online: true, deviceId: this.store.get().deviceId });
+      });
+
+      client.on('message', (topic, payloadBuf) => {
+        this.handleCloudMqttMessage(topic, payloadBuf);
+      });
+
+      client.on('offline', () => {
+        this.cloudConnected = false;
+        this.notifyRenderer('app:cloud-status', { online: false, deviceId: this.store.get().deviceId });
+      });
+
+      client.on('error', (err) => {
+        console.warn('[CloudID] Broker error, trying fallback if needed:', err.message);
+      });
+    } catch (err) {
+      console.error('[CloudID] Failed to init MQTT:', err);
+    }
+  }
+
+  private async handleCloudMqttMessage(topic: string, payloadBuf: Buffer): Promise<void> {
+    let msg: any;
+    try {
+      msg = JSON.parse(payloadBuf.toString('utf-8'));
+    } catch {
+      return;
+    }
+
+    // 1. Response to a ping probe we sent for a Saved Device
+    if (topic === this.clientProbeTopic && msg.type === 'ping-probe-reply' && msg.probeId) {
+      const pending = this.pendingProbes.get(msg.probeId);
+      if (pending) {
+        this.pendingProbes.delete(msg.probeId);
+        pending.resolve({
+          online: true,
+          latencyMs: Math.max(1, Date.now() - pending.start),
+          info: msg.hostInfo,
+        });
+      }
+      return;
+    }
+
+    // 2. Message arriving for our active Client Viewer (controlling a remote machine via ID)
+    if (this.activeClientSubTopic && topic === this.activeClientSubTopic) {
+      this.notifyRenderer('client:cloud-message', msg);
+      return;
+    }
+
+    // 3. Message arriving at THIS Host's Inbox (`swiftdesk/v2/host/<ID>/in`)
+    const cleanHostId = normalizeDeviceId(this.store.get().deviceId);
+    const hostInboxTopic = `swiftdesk/v2/host/${cleanHostId}/in`;
+    if (topic === hostInboxTopic) {
+      // Handle lightweight online status probe
+      if (msg.type === 'ping-probe' && msg.replyTopic && msg.probeId) {
+        const cfg = this.store.get();
+        this.publishCloud(msg.replyTopic, {
+          type: 'ping-probe-reply',
+          probeId: msg.probeId,
+          hostInfo: {
+            deviceId: cfg.deviceId,
+            deviceName: cfg.deviceName,
+            platform: process.platform,
+            port: this.currentPort,
+            version: '1.1.0',
+          },
+        });
+        return;
+      }
+
+      const sessionId = String(msg.sessionId || '');
+      if (!sessionId) return;
+
+      let session = this.sessions.get(sessionId);
+      if (!session && msg.type === 'auth-request') {
+        session = {
+          sessionId,
+          transport: 'cloud',
+          replyTopic: `swiftdesk/v2/client/${sessionId}/in`,
+          remoteIp: `ID: ${msg.controllerId || 'Internet P2P'}`,
+          authenticated: false,
+          controllerId: '',
+          controllerName: 'Remote Device',
+          platform: 'unknown',
+          authMethod: 'password',
+          connectedAt: Date.now(),
+          lastSeenAt: Date.now(),
+        };
+        this.sessions.set(sessionId, session);
+      }
+
+      if (session) {
+        session.lastSeenAt = Date.now();
+        if (msg.type === 'client-disconnect') {
+          const wasAuth = session.authenticated;
+          this.sessions.delete(sessionId);
+          if (wasAuth) {
+            this.inputController.releaseAllInputs();
+            this.notifyRenderer('host:peer-disconnected', { sessionId });
+            this.notifySessionsUpdated();
+          }
+          return;
+        }
+        await this.handleClientMessage(session, msg);
+      }
+    }
+  }
+
+  /**
+   * Probes whether a remote Host ID (XXX-XXX-XXX) is online via Cloud Broker.
+   */
+  public probeCloudDeviceId(
+    targetDeviceId: string,
+    timeoutMs = 2200
+  ): Promise<{ online: boolean; latencyMs?: number; info?: HostPublicInfo }> {
+    return new Promise((resolve) => {
+      if (!this.mqttClient || !this.cloudConnected) {
+        resolve({ online: false });
+        return;
+      }
+      const cleanId = normalizeDeviceId(targetDeviceId);
+      if (!cleanId) {
+        resolve({ online: false });
+        return;
+      }
+
+      const probeId = crypto.randomUUID();
+      const timer = setTimeout(() => {
+        this.pendingProbes.delete(probeId);
+        resolve({ online: false });
+      }, timeoutMs);
+
+      this.pendingProbes.set(probeId, {
+        start: Date.now(),
+        resolve: (res) => {
+          clearTimeout(timer);
+          resolve(res);
+        },
+      });
+
+      this.publishCloud(`swiftdesk/v2/host/${cleanId}/in`, {
+        type: 'ping-probe',
+        probeId,
+        replyTopic: this.clientProbeTopic,
+      });
+    });
+  }
+
+  /**
+   * Used by the Client Renderer to initiate or send messages over a Cloud ID session.
+   */
+  public startClientCloudSession(sessionId: string): void {
+    if (this.activeClientSubTopic && this.mqttClient) {
+      this.mqttClient.unsubscribe(this.activeClientSubTopic);
+    }
+    this.activeClientSubTopic = `swiftdesk/v2/client/${sessionId}/in`;
+    if (this.mqttClient) {
+      this.mqttClient.subscribe(this.activeClientSubTopic, { qos: 0 });
+    }
+  }
+
+  public stopClientCloudSession(targetDeviceId?: string, sessionId?: string): void {
+    if (targetDeviceId && sessionId) {
+      const cleanId = normalizeDeviceId(targetDeviceId);
+      this.publishCloud(`swiftdesk/v2/host/${cleanId}/in`, {
+        type: 'client-disconnect',
+        sessionId,
+      });
+    }
+    if (this.activeClientSubTopic && this.mqttClient) {
+      this.mqttClient.unsubscribe(this.activeClientSubTopic);
+      this.activeClientSubTopic = null;
+    }
+  }
+
+  public sendClientCloudMessage(targetDeviceId: string, payload: Record<string, unknown>): void {
+    const cleanId = normalizeDeviceId(targetDeviceId);
+    this.publishCloud(`swiftdesk/v2/host/${cleanId}/in`, payload);
+  }
+
+  private publishCloud(topic: string, data: unknown): void {
+    if (this.mqttClient && this.cloudConnected) {
+      this.mqttClient.publish(topic, JSON.stringify(data), { qos: 0 });
+    }
+  }
 
   public async start(port?: number): Promise<{ success: boolean; port: number; error?: string }> {
     const targetPort = port || this.store.get().listenPort || 9876;
-    await this.stop();
+    await this.stopLocalServer();
 
     return new Promise((resolve) => {
       const server = http.createServer((req, res) => {
@@ -50,7 +296,7 @@ export class HostSignalingServer {
             deviceName: cfg.deviceName,
             platform: process.platform,
             port: this.currentPort || targetPort,
-            version: '1.0.0',
+            version: '1.1.0',
           };
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(info));
@@ -62,11 +308,11 @@ export class HostSignalingServer {
 
       const wss = new WebSocketServer({
         server,
-        perMessageDeflate: false, // Disable compression for lowest possible latency
+        perMessageDeflate: false,
       });
 
       wss.on('connection', (ws, req) => {
-        this.handleConnection(ws, req);
+        this.handleWsConnection(ws, req);
       });
 
       server.once('error', (err: NodeJS.ErrnoException) => {
@@ -88,17 +334,7 @@ export class HostSignalingServer {
     });
   }
 
-  public async stop(): Promise<void> {
-    for (const session of this.sessions.values()) {
-      try {
-        session.ws.close(1000, 'Host stopping');
-      } catch {
-        // ignore
-      }
-    }
-    this.sessions.clear();
-    this.inputController.releaseAllInputs();
-
+  private async stopLocalServer(): Promise<void> {
     if (this.wss) {
       await new Promise<void>((r) => this.wss!.close(() => r()));
       this.wss = null;
@@ -106,6 +342,27 @@ export class HostSignalingServer {
     if (this.httpServer) {
       await new Promise<void>((r) => this.httpServer!.close(() => r()));
       this.httpServer = null;
+    }
+  }
+
+  public async stop(): Promise<void> {
+    for (const session of this.sessions.values()) {
+      this.sendToSession(session, {
+        type: 'session-closed',
+        reason: 'Máy chủ đã dừng phiên kết nối.',
+      });
+      if (session.ws) {
+        try {
+          session.ws.close(1000, 'Host stopping');
+        } catch {}
+      }
+    }
+    this.sessions.clear();
+    this.inputController.releaseAllInputs();
+    await this.stopLocalServer();
+    if (this.mqttClient) {
+      this.mqttClient.end(true);
+      this.mqttClient = null;
     }
   }
 
@@ -129,8 +386,15 @@ export class HostSignalingServer {
   public disconnectSession(sessionId: string): void {
     const s = this.sessions.get(sessionId);
     if (s) {
-      this.sendJson(s.ws, { type: 'session-closed', reason: 'Máy chủ đã ngắt kết nối phiên này.' });
-      s.ws.close(1000, 'Disconnected by host');
+      this.sendToSession(s, {
+        type: 'session-closed',
+        reason: 'Máy chủ đã ngắt kết nối phiên này.',
+      });
+      if (s.ws) {
+        try {
+          s.ws.close(1000, 'Disconnected by host');
+        } catch {}
+      }
       this.sessions.delete(sessionId);
       this.inputController.releaseAllInputs();
       this.notifyRenderer('host:peer-disconnected', { sessionId });
@@ -140,8 +404,18 @@ export class HostSignalingServer {
 
   public sendSignalToClient(sessionId: string, payload: Record<string, unknown>): void {
     const s = this.sessions.get(sessionId);
-    if (s && s.ws.readyState === WebSocket.OPEN) {
-      this.sendJson(s.ws, payload);
+    if (s) {
+      this.sendToSession(s, payload);
+    }
+  }
+
+  private sendToSession(session: ClientSession, payload: unknown): void {
+    if (session.transport === 'ws' && session.ws) {
+      if (session.ws.readyState === WebSocket.OPEN) {
+        session.ws.send(JSON.stringify(payload));
+      }
+    } else if (session.transport === 'cloud' && session.replyTopic) {
+      this.publishCloud(session.replyTopic, payload);
     }
   }
 
@@ -172,13 +446,14 @@ export class HostSignalingServer {
     });
   }
 
-  private handleConnection(ws: WebSocket, req: http.IncomingMessage): void {
+  private handleWsConnection(ws: WebSocket, req: http.IncomingMessage): void {
     const sessionId = crypto.randomUUID();
     const rawIp = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
     const cfg = this.store.get();
 
     const session: ClientSession = {
       sessionId,
+      transport: 'ws',
       ws,
       remoteIp: rawIp,
       authenticated: false,
@@ -187,12 +462,12 @@ export class HostSignalingServer {
       platform: 'unknown',
       authMethod: 'password',
       connectedAt: Date.now(),
+      lastSeenAt: Date.now(),
     };
 
     this.sessions.set(sessionId, session);
 
-    // Send initial hello with host metadata
-    this.sendJson(ws, {
+    this.sendToSession(session, {
       type: 'hello',
       sessionId,
       hostInfo: {
@@ -200,7 +475,7 @@ export class HostSignalingServer {
         deviceName: cfg.deviceName,
         platform: process.platform,
         port: this.currentPort,
-        version: '1.0.0',
+        version: '1.1.0',
       },
     });
 
@@ -209,7 +484,7 @@ export class HostSignalingServer {
         const msg = JSON.parse(rawData.toString());
         await this.handleClientMessage(session, msg);
       } catch (err) {
-        console.error('[SignalingServer] Invalid message:', err);
+        console.error('[SignalingServer] Invalid WS message:', err);
       }
     });
 
@@ -230,7 +505,7 @@ export class HostSignalingServer {
 
   private async handleClientMessage(session: ClientSession, msg: any): Promise<void> {
     if (msg.type === 'ping') {
-      this.sendJson(session.ws, { type: 'pong', ts: msg.ts });
+      this.sendToSession(session, { type: 'pong', ts: msg.ts });
       return;
     }
 
@@ -245,22 +520,18 @@ export class HostSignalingServer {
       let authenticated = false;
       let authMethod: 'password' | 'trust-token' = 'password';
 
-      // 1. Check saved 1-click Trust Token first
       if (trustToken && this.store.verifyTrustToken(controllerId, trustToken)) {
         authenticated = true;
         authMethod = 'trust-token';
       } else if (password && this.store.verifyPassword(password)) {
-        // 2. Verify Host Password
         authenticated = true;
         authMethod = 'password';
       }
 
       if (!authenticated) {
         const reason =
-          trustToken && !password
-            ? 'TOKEN_EXPIRED_OR_INVALID'
-            : 'INVALID_PASSWORD';
-        this.sendJson(session.ws, {
+          trustToken && !password ? 'TOKEN_EXPIRED_OR_INVALID' : 'INVALID_PASSWORD';
+        this.sendToSession(session, {
           type: 'auth-failed',
           reason,
           message:
@@ -268,10 +539,12 @@ export class HostSignalingServer {
               ? 'Phiên đăng nhập tự động đã hết hạn. Vui lòng nhập mật khẩu của máy đích.'
               : 'Mật khẩu không chính xác. Vui lòng kiểm tra lại.',
         });
+        if (session.transport === 'cloud') {
+          this.sessions.delete(session.sessionId);
+        }
         return;
       }
 
-      // Issue or refresh Trust Token so future connections are 1-click without password
       const issuedTrustToken = this.store.issueTrustToken(controllerId, controllerName, platform);
 
       session.authenticated = true;
@@ -284,7 +557,7 @@ export class HostSignalingServer {
       const displays = await this.getDisplaySources();
       const cfg = this.store.get();
 
-      this.sendJson(session.ws, {
+      this.sendToSession(session, {
         type: 'auth-success',
         sessionId: session.sessionId,
         trustToken: issuedTrustToken,
@@ -293,25 +566,24 @@ export class HostSignalingServer {
           deviceName: cfg.deviceName,
           platform: process.platform,
           port: this.currentPort,
-          version: '1.0.0',
+          version: '1.1.0',
         },
         displays,
       });
 
       this.notifySessionsUpdated();
 
-      // Instruct Host Renderer to begin WebRTC 60FPS screen capture for this session
       const primaryDisplay = displays.find((d) => d.isPrimary) || displays[0];
       this.notifyRenderer('host:start-webrtc', {
         sessionId: session.sessionId,
         sourceId: primaryDisplay?.id,
         displayId: primaryDisplay?.displayId,
         quality,
+        transport: session.transport,
       });
       return;
     }
 
-    // All subsequent commands require authentication
     if (!session.authenticated) {
       return;
     }
@@ -329,19 +601,14 @@ export class HostSignalingServer {
       case 'webrtc-answer':
       case 'webrtc-ice':
       case 'switch-display':
-      case 'change-quality': {
+      case 'change-quality':
+      case 'request-frame-relay': {
         this.notifyRenderer('host:signal-from-client', {
           sessionId: session.sessionId,
           ...msg,
         });
         break;
       }
-    }
-  }
-
-  private sendJson(ws: WebSocket, data: unknown): void {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(data));
     }
   }
 

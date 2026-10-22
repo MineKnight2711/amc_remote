@@ -8,13 +8,15 @@ export interface NetworkInterfaceInfo {
 }
 
 export interface SavedDevice {
-  id: string; // Remote device unique ID (or ip:port fallback)
+  id: string; // Remote device unique ID (e.g. "482-910-375" or "ip:port")
+  deviceId?: string; // 9-digit Cloud Device ID (XXX-XXX-XXX)
   name: string; // Remote device hostname or custom alias
-  ip: string;
+  ip: string; // Can be IP or Device ID (XXX-XXX-XXX)
   port: number;
+  connectionMode?: 'cloud-id' | 'direct-ip';
   platform: string; // 'win32' | 'darwin' | 'linux'
   trustToken: string; // Issued by host upon first successful password authentication
-  savedPassword?: string; // Optional encrypted/local fallback if user wants password remembered too
+  savedPassword?: string; // Optional saved password fallback
   lastConnectedAt: number;
   online?: boolean;
   latencyMs?: number;
@@ -33,7 +35,7 @@ export interface AppConfig {
   deviceId: string;
   deviceName: string;
   listenPort: number;
-  password: string; // Plaintext or viewable password on host machine so user can see/change it easily
+  password: string; // Viewable/editable password on host machine
   passwordHash: string;
   hostSecret: string;
   autoStart: boolean;

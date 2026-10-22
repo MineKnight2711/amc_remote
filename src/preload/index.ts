@@ -33,6 +33,14 @@ const api = {
   sendSignalToClient: (sessionId: string, payload: Record<string, unknown>) =>
     ipcRenderer.send('host:signal-to-client', { sessionId, payload }),
 
+  // Client Cloud ID Session IPC
+  startClientCloudSession: (sessionId: string) =>
+    ipcRenderer.send('client:start-cloud-session', sessionId),
+  stopClientCloudSession: (targetDeviceId?: string, sessionId?: string) =>
+    ipcRenderer.send('client:stop-cloud-session', { targetDeviceId, sessionId }),
+  sendClientCloudMessage: (targetDeviceId: string, payload: Record<string, unknown>) =>
+    ipcRenderer.send('client:send-cloud-msg', { targetDeviceId, payload }),
+
   // Event listeners from Main -> Renderer
   onStartHostWebRTC: (callback: (data: any) => void) => {
     ipcRenderer.on('host:start-webrtc', (_e, data) => callback(data));
@@ -48,6 +56,12 @@ const api = {
   },
   onConfigUpdated: (callback: (config: any) => void) => {
     ipcRenderer.on('app:config-updated', (_e, config) => callback(config));
+  },
+  onClientCloudMessage: (callback: (msg: any) => void) => {
+    ipcRenderer.on('client:cloud-message', (_e, msg) => callback(msg));
+  },
+  onCloudStatus: (callback: (status: { online: boolean; deviceId: string }) => void) => {
+    ipcRenderer.on('app:cloud-status', (_e, status) => callback(status));
   },
 };
 
