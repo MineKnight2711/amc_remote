@@ -50,7 +50,9 @@ if (!isMultiInstanceAllowed) {
   if (!gotLock) {
     app.quit();
   } else {
-    app.on('second-instance', () => {
+    app.on('second-instance', (_event, argv) => {
+      // A duplicate login-item launch must not pop the window open; a user launch (shortcut) should
+      if (argv.includes('--autostart')) return;
       showMainWindow();
     });
   }
@@ -375,6 +377,7 @@ app.whenReady().then(async () => {
   trayManager.init();
 
   await AutoStartManager.setAutoStart(store.get().autoStart);
+  AutoStartManager.ensureWindowsShortcuts();
   await signalingServer.start(store.get().listenPort);
   trayManager.refreshMenu();
   upnpMapper.warmUp();
