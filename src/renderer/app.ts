@@ -41,6 +41,7 @@
     minimizeToTray: boolean;
     defaultQuality: 'ultra' | 'balanced' | 'low';
     allowClipboardSync: boolean;
+    mapCtrlToCmd: boolean;
     savedDevices: SavedDevice[];
     trustedControllers: TrustedController[];
   }
@@ -114,6 +115,7 @@
   let lastDiagnostics = '';
 
   let activeRemoteDisplayId = '';
+  let activeRemotePlatform = '';
   let activeRemoteTargetLabel = '';
   let activeRemoteIp = '';
   let activeRemotePort = 9876;
@@ -273,6 +275,7 @@
   const elBtnViewerClipboard = document.getElementById('btn-viewer-clipboard')!;
   const elBtnViewerAltTab = document.getElementById('btn-viewer-alttab')!;
   const elBtnViewerWinKey = document.getElementById('btn-viewer-winkey')!;
+  const elBtnViewerCtrlCmd = document.getElementById('btn-viewer-ctrlcmd')!;
   const elBtnViewerFullscreen = document.getElementById('btn-viewer-fullscreen')!;
   const elBtnViewerDisconnect = document.getElementById('btn-viewer-disconnect')!;
   const elViewerStage = document.getElementById('viewer-stage')!;
@@ -1331,6 +1334,8 @@
   ): void {
     elViewerHostName.textContent = hostInfo.deviceName || activeRemoteTargetLabel;
     elViewerHostIp.textContent = activeRemoteTargetLabel;
+    activeRemotePlatform = String(hostInfo.platform || '');
+    renderCtrlCmdToggle();
     elViewerQualitySelect.value = quality;
     elViewerLoadingText.textContent = 'Đang thiết lập đường truyền P2P 60FPS độ phân giải gốc...';
     elViewerLoading.classList.remove('hidden');
@@ -1667,10 +1672,7 @@
       button: mapMouseButton(e.button),
       x: coords.x,
       y: coords.y,
-      ctrlKey: e.ctrlKey,
-      shiftKey: e.shiftKey,
-      altKey: e.altKey,
-      metaKey: e.metaKey,
+      ...remoteModifiers(e),
     });
   });
 
@@ -1684,10 +1686,7 @@
       button: mapMouseButton(e.button),
       x: coords.x,
       y: coords.y,
-      ctrlKey: e.ctrlKey,
-      shiftKey: e.shiftKey,
-      altKey: e.altKey,
-      metaKey: e.metaKey,
+      ...remoteModifiers(e),
     });
   });
 
@@ -1711,41 +1710,127 @@
   // Keys held on the viewer; their keyup is never delivered if the OS steals focus mid-press
   // (Win key opens Start, Alt+Tab, Ctrl+Alt+Del...), so they're released explicitly on blur
   const pressedKeys = new Map<string, { key: string; keyCode: number }>();
+  // Set when a keydown carried no usable key: its character is delivered by the following keypress
+  let awaitingKeypressText = false;
+
+  // Windows virtual-key code -> DOM code (letters, digits, numpad and F-keys are computed)
+  const KEYCODE_TO_DOM_CODE: Record<number, string> = {
+    8: 'Backspace', 9: 'Tab', 13: 'Enter', 16: 'ShiftLeft', 17: 'ControlLeft', 18: 'AltLeft',
+    19: 'Pause', 20: 'CapsLock', 27: 'Escape', 32: 'Space', 33: 'PageUp', 34: 'PageDown',
+    35: 'End', 36: 'Home', 37: 'ArrowLeft', 38: 'ArrowUp', 39: 'ArrowRight', 40: 'ArrowDown',
+    44: 'PrintScreen', 45: 'Insert', 46: 'Delete', 91: 'MetaLeft', 92: 'MetaRight', 93: 'ContextMenu',
+    106: 'NumpadMultiply', 107: 'NumpadAdd', 109: 'NumpadSubtract', 110: 'NumpadDecimal',
+    111: 'NumpadDivide', 144: 'NumLock', 145: 'ScrollLock', 186: 'Semicolon', 187: 'Equal',
+    188: 'Comma', 189: 'Minus', 190: 'Period', 191: 'Slash', 192: 'Backquote', 219: 'BracketLeft',
+    220: 'Backslash', 221: 'BracketRight', 222: 'Quote',
+  };
+
+  /**
+   * Vietnamese IME tools (EVKey, Unikey) swallow letter keys and re-inject them without a hardware
+   * scan code, so Chromium reports an empty `code` — the Mac host then had no key to press (only
+   * digits, which Telex leaves alone, got through). Recover the key from the virtual-key code.
+   */
+  function resolveDomCode(e: KeyboardEvent): string {
+    if (e.code && e.code !== 'Unidentified') return e.code;
+    const kc = e.keyCode;
+    if (kc >= 65 && kc <= 90) return `Key${String.fromCharCode(kc)}`;
+    if (kc >= 48 && kc <= 57) return `Digit${kc - 48}`;
+    if (kc >= 96 && kc <= 105) return `Numpad${kc - 96}`;
+    if (kc >= 112 && kc <= 123) return `F${kc - 111}`;
+    return KEYCODE_TO_DOM_CODE[kc] || '';
+  }
+
+  function isSingleCharacter(key: string): boolean {
+    return [...key].length === 1; // 'Unidentified', 'Process', 'Dead'... are names, not characters
+  }
+
+  const CTRL_CMD_SWAP: Record<string, { code: string; keyCode: number }> = {
+    ControlLeft: { code: 'MetaLeft', keyCode: 91 },
+    ControlRight: { code: 'MetaRight', keyCode: 92 },
+    MetaLeft: { code: 'ControlLeft', keyCode: 17 },
+    MetaRight: { code: 'ControlRight', keyCode: 17 },
+  };
+
+  function isCtrlCmdSwapActive(): boolean {
+    return !!currentConfig?.mapCtrlToCmd && activeRemotePlatform === 'darwin' && currentPlatform !== 'darwin';
+  }
+
+  /** Modifier state as the remote should see it (Ctrl and Win/⌘ swapped when controlling a Mac). */
+  function remoteModifiers(e: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean; metaKey: boolean }) {
+    const swap = isCtrlCmdSwapActive();
+    return {
+      ctrlKey: swap ? e.metaKey : e.ctrlKey,
+      metaKey: swap ? e.ctrlKey : e.metaKey,
+      shiftKey: e.shiftKey,
+      altKey: e.altKey,
+    };
+  }
+
+  function sendKeyEvent(type: 'keydown' | 'keyup', e: KeyboardEvent, code: string): void {
+    let keyCode = e.keyCode;
+    if (isCtrlCmdSwapActive() && CTRL_CMD_SWAP[code]) {
+      ({ code, keyCode } = CTRL_CMD_SWAP[code]);
+    }
+    if (type === 'keydown') pressedKeys.set(code, { key: e.key, keyCode });
+    else pressedKeys.delete(code);
+    sendRemoteInput({ type, key: e.key, code, keyCode, ...remoteModifiers(e) });
+  }
 
   elViewerStage.addEventListener('keydown', (e) => {
     if (elViewerOverlay.classList.contains('hidden')) return;
-    e.preventDefault();
     e.stopPropagation();
-    if (e.code) pressedKeys.set(e.code, { key: e.key, keyCode: e.keyCode });
+    const code = resolveDomCode(e);
+    if (!code) {
+      // No key behind it at all: a character injected as a Unicode packet (EVKey's "â", "ệ"...)
+      if (isSingleCharacter(e.key)) {
+        e.preventDefault();
+        sendRemoteInput({ type: 'text', text: e.key });
+      } else {
+        awaitingKeypressText = true; // let the browser deliver the character via keypress
+      }
+      return;
+    }
+    e.preventDefault();
+    sendKeyEvent('keydown', e, code);
+  });
 
-    sendRemoteInput({
-      type: 'keydown',
-      key: e.key,
-      code: e.code,
-      keyCode: e.keyCode,
-      ctrlKey: e.ctrlKey,
-      shiftKey: e.shiftKey,
-      altKey: e.altKey,
-      metaKey: e.metaKey,
-    });
+  elViewerStage.addEventListener('keypress', (e) => {
+    if (elViewerOverlay.classList.contains('hidden')) return;
+    e.preventDefault();
+    if (awaitingKeypressText && isSingleCharacter(e.key)) {
+      sendRemoteInput({ type: 'text', text: e.key });
+    }
+    awaitingKeypressText = false;
   });
 
   elViewerStage.addEventListener('keyup', (e) => {
     if (elViewerOverlay.classList.contains('hidden')) return;
     e.preventDefault();
     e.stopPropagation();
-    pressedKeys.delete(e.code);
+    const code = resolveDomCode(e);
+    if (code) sendKeyEvent('keyup', e, code);
+  });
 
-    sendRemoteInput({
-      type: 'keyup',
-      key: e.key,
-      code: e.code,
-      keyCode: e.keyCode,
-      ctrlKey: e.ctrlKey,
-      shiftKey: e.shiftKey,
-      altKey: e.altKey,
-      metaKey: e.metaKey,
-    });
+  function renderCtrlCmdToggle(): void {
+    const relevant = activeRemotePlatform === 'darwin' && currentPlatform !== 'darwin';
+    const on = !!currentConfig?.mapCtrlToCmd;
+    elBtnViewerCtrlCmd.classList.toggle('hidden', !relevant);
+    elBtnViewerCtrlCmd.classList.toggle('active', on);
+    elBtnViewerCtrlCmd.textContent = on ? 'Ctrl→⌘: BẬT' : 'Ctrl→⌘: TẮT';
+  }
+
+  elBtnViewerCtrlCmd.addEventListener('click', async () => {
+    releaseHeldRemoteInputs(); // never leave a key pressed under one mapping and released under the other
+    const res = await swiftdesk.updateSettings({ mapCtrlToCmd: !currentConfig.mapCtrlToCmd });
+    if (res.config) currentConfig = res.config;
+    renderCtrlCmdToggle();
+    showToast(
+      currentConfig.mapCtrlToCmd
+        ? 'Ctrl trên máy này = ⌘ Command trên Mac (Ctrl+C/V/Z → ⌘C/⌘V/⌘Z)'
+        : 'Đã tắt chuyển Ctrl → ⌘ (giữ nguyên phím)',
+      'info'
+    );
+    elViewerStage.focus();
   });
 
   /** Release every key / mouse button still held remotely (focus lost, window hidden, disconnect). */

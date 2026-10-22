@@ -845,6 +845,12 @@ body {
   background: rgba(255, 255, 255, 0.15);
 }
 
+.toolbar-btn.active {
+  background: rgba(16, 185, 129, 0.25);
+  border-color: rgba(16, 185, 129, 0.6);
+  color: #6ee7b7;
+}
+
 .toolbar-btn-danger {
   background: rgba(239, 68, 68, 0.22);
   border-color: rgba(239, 68, 68, 0.45);

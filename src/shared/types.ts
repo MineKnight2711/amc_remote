@@ -42,6 +42,7 @@ export interface AppConfig {
   minimizeToTray: boolean;
   defaultQuality: QualityPreset;
   allowClipboardSync: boolean;
+  mapCtrlToCmd: boolean; // Viewer on Windows/Linux controlling a Mac: Ctrl acts as ⌘ (and Win as Control)
   savedDevices: SavedDevice[];
   trustedControllers: TrustedController[];
 }
@@ -93,6 +94,11 @@ export type RemoteInputEvent =
       shiftKey?: boolean;
       altKey?: boolean;
       metaKey?: boolean;
+    }
+  | {
+      // Characters with no physical key behind them (e.g. "â" injected by EVKey/Unikey as a Unicode packet)
+      type: 'text';
+      text: string;
     }
   | {
       type: 'special-combo';

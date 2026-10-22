@@ -14,6 +14,8 @@ const MOUSEEVENTF_HWHEEL = 0x1000;
 // Windows Keyboard Flags
 const KEYEVENTF_EXTENDEDKEY = 0x0001;
 const KEYEVENTF_KEYUP = 0x0002;
+const KEYEVENTF_UNICODE = 0x0004;
+const INPUT_KEYBOARD = 1;
 
 // macOS CGEvent Constants
 const kCGHIDEventTap = 0;
@@ -109,6 +111,8 @@ export class InputController {
   private winMouseEvent: ((flags: number, dx: number, dy: number, data: number, extra: number) => void) | null = null;
   private winKeybdEvent: ((vk: number, scan: number, flags: number, extra: number) => void) | null = null;
   private winMapVirtualKey: ((code: number, mapType: number) => number) | null = null;
+  private winSendInput: ((count: number, input: unknown, size: number) => number) | null = null;
+  private winInputSize = 0;
 
   private macCreateMouseEvent: ((source: null, type: number, pos: { x: number; y: number }, btn: number) => unknown) | null = null;
   private macCreateKeyboardEvent: ((source: null, vk: number, keyDown: boolean) => unknown) | null = null;
@@ -116,6 +120,7 @@ export class InputController {
   private macPostEvent: ((tap: number, ev: unknown) => void) | null = null;
   private macCFRelease: ((cf: unknown) => void) | null = null;
   private macSetFlags: ((ev: unknown, flags: number) => void) | null = null;
+  private macSetUnicodeString: ((ev: unknown, length: number, chars: Uint16Array) => void) | null = null;
 
   private lastMousePos = { x: 0, y: 0 };
   private buttonsDown = { left: false, middle: false, right: false };
@@ -143,6 +148,27 @@ export class InputController {
         this.winMapVirtualKey = user32.func(
           'uint32_t __stdcall MapVirtualKeyW(uint32_t uCode, uint32_t uMapType)'
         );
+        const KEYBDINPUT = koffi.struct('KEYBDINPUT', {
+          wVk: 'uint16_t',
+          wScan: 'uint16_t',
+          dwFlags: 'uint32_t',
+          time: 'uint32_t',
+          dwExtraInfo: 'uintptr_t',
+        });
+        const MOUSEINPUT = koffi.struct('MOUSEINPUT', {
+          dx: 'int32_t',
+          dy: 'int32_t',
+          mouseData: 'uint32_t',
+          dwFlags: 'uint32_t',
+          time: 'uint32_t',
+          dwExtraInfo: 'uintptr_t',
+        });
+        const INPUT = koffi.struct('INPUT', {
+          type: 'uint32_t',
+          u: koffi.union('INPUT_UNION', { mi: MOUSEINPUT, ki: KEYBDINPUT }),
+        });
+        this.winSendInput = user32.func('uint32_t __stdcall SendInput(uint32_t cInputs, INPUT *pInputs, int cbSize)');
+        this.winInputSize = koffi.sizeof(INPUT);
         console.log('[InputController] Loaded ultra-low-latency Windows user32.dll FFI');
       } else if (process.platform === 'darwin') {
         const cg = koffi.load('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics');
@@ -159,9 +185,17 @@ export class InputController {
           'void* CGEventCreateScrollWheelEvent2(void* source, uint32_t units, uint32_t wheelCount, int32_t wheel1, int32_t wheel2, int32_t wheel3)'
         );
         this.macPostEvent = cg.func('void CGEventPost(uint32_t tap, void* event)');
-        this.macSetFlags = cg.func('void CGEventSetFlags(void* event, uint64_t flags)');
         this.macCFRelease = cf.func('void CFRelease(void* cf)');
         console.log('[InputController] Loaded ultra-low-latency macOS CoreGraphics FFI');
+        // Optional extras: if one fails to bind, basic mouse/keyboard input above must keep working
+        try {
+          this.macSetFlags = cg.func('void CGEventSetFlags(void* event, uint64_t flags)');
+          this.macSetUnicodeString = cg.func(
+            'void CGEventKeyboardSetUnicodeString(void* event, unsigned long stringLength, const uint16_t* unicodeString)'
+          );
+        } catch (err) {
+          console.error('[InputController] Failed to bind optional CoreGraphics functions:', err);
+        }
       }
     } catch (err) {
       console.error('[InputController] Failed to load native FFI:', err);
@@ -235,6 +269,12 @@ export class InputController {
         case 'keydown':
         case 'keyup': {
           this.keyboardEvent(event.code, event.keyCode, event.type === 'keydown', event);
+          break;
+        }
+        case 'text': {
+          if (typeof event.text === 'string' && event.text.length > 0 && event.text.length <= 64) {
+            this.typeText(event.text);
+          }
           break;
         }
         case 'special-combo': {
@@ -364,6 +404,37 @@ export class InputController {
         // lost (Win/Alt+Tab steal focus on the viewer) stays "held" in macOS, so every letter becomes
         // a ⌘-shortcut and nothing can be typed (⌘Q even quits SwiftDesk itself)
         if (modifiers && this.macSetFlags) this.macSetFlags(ev, macModifierFlags(modifiers));
+        this.macPostEvent(kCGHIDEventTap, ev);
+        this.macCFRelease(ev);
+      }
+    }
+  }
+
+  /** Types characters directly as Unicode, independent of the host's keyboard layout / IME. */
+  private typeText(text: string): void {
+    const units = Uint16Array.from({ length: text.length }, (_, i) => text.charCodeAt(i));
+    if (process.platform === 'win32' && this.winSendInput) {
+      for (const unit of units) {
+        for (const flags of [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP]) {
+          this.winSendInput(
+            1,
+            { type: INPUT_KEYBOARD, u: { ki: { wVk: 0, wScan: unit, dwFlags: flags, time: 0, dwExtraInfo: 0 } } },
+            this.winInputSize
+          );
+        }
+      }
+    } else if (
+      process.platform === 'darwin' &&
+      this.macCreateKeyboardEvent &&
+      this.macSetUnicodeString &&
+      this.macPostEvent &&
+      this.macCFRelease
+    ) {
+      for (const isDown of [true, false]) {
+        const ev = this.macCreateKeyboardEvent(null, 0, isDown);
+        if (!ev) continue;
+        this.macSetUnicodeString(ev, units.length, units);
+        if (this.macSetFlags) this.macSetFlags(ev, 0);
         this.macPostEvent(kCGHIDEventTap, ev);
         this.macCFRelease(ev);
       }

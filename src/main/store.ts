@@ -58,6 +58,7 @@ export class ConfigStore {
           minimizeToTray: parsed.minimizeToTray !== undefined ? parsed.minimizeToTray : true,
           defaultQuality: parsed.defaultQuality || 'ultra',
           allowClipboardSync: parsed.allowClipboardSync !== undefined ? parsed.allowClipboardSync : true,
+          mapCtrlToCmd: parsed.mapCtrlToCmd !== undefined ? parsed.mapCtrlToCmd : true,
           savedDevices: Array.isArray(parsed.savedDevices) ? parsed.savedDevices : [],
           trustedControllers: Array.isArray(parsed.trustedControllers) ? parsed.trustedControllers : [],
         };
@@ -79,6 +80,7 @@ export class ConfigStore {
       minimizeToTray: true,
       defaultQuality: 'ultra',
       allowClipboardSync: true,
+      mapCtrlToCmd: true,
       savedDevices: [],
       trustedControllers: [],
     };
