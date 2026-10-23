@@ -45,6 +45,8 @@ let powerSaveId: number | null = null;
 const upnpMapper = new UpnpPortMapper();
 
 const isMultiInstanceAllowed = process.argv.includes('--multi-instance');
+// Build this process started from; compared when a second instance is launched (see buildStamp)
+const startupBuildStamp = buildStamp();
 const isAutoStarted = process.argv.includes('--autostart');
 
 // macOS pre-login instance, started at the login window (after a restart, or after logging out) by
@@ -72,10 +74,33 @@ if (!isMultiInstanceAllowed) {
     app.quit();
   } else {
     app.on('second-instance', (_event, argv) => {
+      // `npm start` while SwiftDesk already runs (e.g. in the tray) only reaches this handler, so the
+      // new build would never load: if the code on disk changed since we started, restart into it
+      if (buildStamp() !== startupBuildStamp) {
+        console.log('[Main] Newer build detected on launch, restarting into it');
+        app.relaunch();
+        app.quit();
+        return;
+      }
       // A duplicate login-item launch must not pop the window open; a user launch (shortcut) should
       if (argv.includes('--autostart')) return;
       showMainWindow();
     });
+  }
+}
+
+/** Modification times of the compiled main + renderer code: changes whenever `npm run build` runs. */
+function buildStamp(): string {
+  try {
+    return [
+      path.join(__dirname, 'index.js'),
+      path.join(__dirname, '..', 'renderer', 'app.js'),
+      path.join(__dirname, '..', 'renderer', 'index.html'),
+    ]
+      .map((f) => fs.statSync(f).mtimeMs)
+      .join('|');
+  } catch {
+    return '';
   }
 }
 

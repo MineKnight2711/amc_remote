@@ -311,6 +311,7 @@
   const elKbdAltTab = document.getElementById('kbd-alttab')!;
   const elKbdWinKey = document.getElementById('kbd-winkey')!;
   const elBtnViewerCursor = document.getElementById('btn-viewer-cursor')!;
+  const elBtnViewerCtrlC = document.getElementById('btn-viewer-ctrlc')!;
   const elKbdCursor = document.getElementById('kbd-cursor')!;
   const elStatPath = document.getElementById('stat-path')!;
   const elViewerResSelect = document.getElementById('viewer-res-select') as HTMLSelectElement;
@@ -1974,36 +1975,63 @@
     return [...key].length === 1; // 'Unidentified', 'Process', 'Dead'... are names, not characters
   }
 
+  // Controlling a Mac: LEFT Ctrl acts as ⌘ (copy, paste, undo...). RIGHT Ctrl and the Win key stay a real
+  // Control, which macOS terminals need: ^C to stop a command, ^D, ^Z, ^R...
   const CTRL_CMD_SWAP: Record<string, { code: string; keyCode: number }> = {
     ControlLeft: { code: 'MetaLeft', keyCode: 91 },
-    ControlRight: { code: 'MetaRight', keyCode: 92 },
     MetaLeft: { code: 'ControlLeft', keyCode: 17 },
     MetaRight: { code: 'ControlRight', keyCode: 17 },
   };
+  const MODIFIER_KEY_CODES = new Set(['ControlLeft', 'ControlRight', 'MetaLeft', 'MetaRight']);
+  // Physical Ctrl/Win keys held on this machine: KeyboardEvent.ctrlKey can't tell left from right Ctrl
+  const heldModifierCodes = new Set<string>();
 
   function isCtrlCmdSwapActive(): boolean {
     return !!currentConfig?.mapCtrlToCmd && activeRemotePlatform === 'darwin' && currentPlatform !== 'darwin';
   }
 
-  /** Modifier state as the remote should see it (Ctrl and Win/⌘ swapped when controlling a Mac). */
+  /** Modifier state as the remote should see it (left Ctrl = ⌘ when controlling a Mac). */
   function remoteModifiers(e: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean; metaKey: boolean }) {
-    const swap = isCtrlCmdSwapActive();
-    return {
-      ctrlKey: swap ? e.metaKey : e.ctrlKey,
-      metaKey: swap ? e.ctrlKey : e.metaKey,
-      shiftKey: e.shiftKey,
-      altKey: e.altKey,
-    };
+    if (!isCtrlCmdSwapActive()) {
+      return { ctrlKey: e.ctrlKey, metaKey: e.metaKey, shiftKey: e.shiftKey, altKey: e.altKey };
+    }
+    const leftCtrl = heldModifierCodes.has('ControlLeft');
+    const rightCtrl = heldModifierCodes.has('ControlRight');
+    const win = heldModifierCodes.has('MetaLeft') || heldModifierCodes.has('MetaRight');
+    // A Ctrl held since before the viewer got focus: we never saw which one, treat it as the left one
+    const unknownCtrl = e.ctrlKey && !leftCtrl && !rightCtrl;
+    return { metaKey: leftCtrl || unknownCtrl, ctrlKey: rightCtrl || win, shiftKey: e.shiftKey, altKey: e.altKey };
   }
 
-  function sendKeyEvent(type: 'keydown' | 'keyup', e: KeyboardEvent, code: string): void {
+  /** Builds the remote key event now (modifier state at press time), so it can be sent later. */
+  function buildKeyEvent(type: 'keydown' | 'keyup', e: KeyboardEvent, code: string): Record<string, unknown> {
     let keyCode = e.keyCode;
     if (isCtrlCmdSwapActive() && CTRL_CMD_SWAP[code]) {
       ({ code, keyCode } = CTRL_CMD_SWAP[code]);
     }
     if (type === 'keydown') pressedKeys.set(code, { key: e.key, keyCode });
     else pressedKeys.delete(code);
-    sendRemoteInput({ type, key: e.key, code, keyCode, ...remoteModifiers(e) });
+    return { type, key: e.key, code, keyCode, ...remoteModifiers(e) };
+  }
+
+  // Key events go out immediately, except while a clipboard push is in flight for a paste: then they
+  // queue behind it, so the V of Ctrl+V can never reach the remote before the clipboard does
+  let keyQueue: Promise<void> = Promise.resolve();
+  let keyQueueDepth = 0;
+  function sendKeyOrdered(payload: Record<string, unknown>, waitFor?: Promise<void> | null): void {
+    if (!waitFor && keyQueueDepth === 0) {
+      sendRemoteInput(payload);
+      return;
+    }
+    keyQueueDepth++;
+    keyQueue = keyQueue
+      .then(() => waitFor || undefined)
+      .catch(() => {})
+      .then(() => sendRemoteInput(payload))
+      .catch(() => {})
+      .finally(() => {
+        keyQueueDepth--;
+      });
   }
 
   elViewerStage.addEventListener('keydown', (e) => {
@@ -2014,21 +2042,29 @@
       // No key behind it at all: a character injected as a Unicode packet (EVKey's "â", "ệ"...)
       if (isSingleCharacter(e.key)) {
         e.preventDefault();
-        sendRemoteInput({ type: 'text', text: e.key });
+        sendKeyOrdered({ type: 'text', text: e.key });
       } else {
         awaitingKeypressText = true; // let the browser deliver the character via keypress
       }
       return;
     }
     e.preventDefault();
-    sendKeyEvent('keydown', e, code);
+    let waitFor: Promise<void> | null = null;
+    if (MODIFIER_KEY_CODES.has(code)) {
+      heldModifierCodes.add(code);
+      // Ctrl/⌘ starts a paste: push this machine's clipboard now if it changed since the last push
+      if (code === 'ControlLeft' || code === 'MetaLeft') syncClipboardToRemote();
+    } else if (code === 'KeyV' && (e.ctrlKey || e.metaKey)) {
+      waitFor = clipboardSyncPromise; // hold the V until that push has been sent
+    }
+    sendKeyOrdered(buildKeyEvent('keydown', e, code), waitFor);
   });
 
   elViewerStage.addEventListener('keypress', (e) => {
     if (elViewerOverlay.classList.contains('hidden')) return;
     e.preventDefault();
     if (awaitingKeypressText && isSingleCharacter(e.key)) {
-      sendRemoteInput({ type: 'text', text: e.key });
+      sendKeyOrdered({ type: 'text', text: e.key });
     }
     awaitingKeypressText = false;
   });
@@ -2038,8 +2074,19 @@
     e.preventDefault();
     e.stopPropagation();
     const code = resolveDomCode(e);
-    if (code) sendKeyEvent('keyup', e, code);
+    if (!code) return;
+    heldModifierCodes.delete(code);
+    sendKeyOrdered(buildKeyEvent('keyup', e, code));
   });
+
+  /** A real Control+C for the remote (stops a command in a macOS terminal), whatever the mapping. */
+  function sendControlC(): void {
+    const mods = { shiftKey: false, altKey: false, metaKey: false };
+    sendKeyOrdered({ type: 'keydown', key: 'Control', code: 'ControlLeft', keyCode: 17, ctrlKey: true, ...mods });
+    sendKeyOrdered({ type: 'keydown', key: 'c', code: 'KeyC', keyCode: 67, ctrlKey: true, ...mods });
+    sendKeyOrdered({ type: 'keyup', key: 'c', code: 'KeyC', keyCode: 67, ctrlKey: true, ...mods });
+    sendKeyOrdered({ type: 'keyup', key: 'Control', code: 'ControlLeft', keyCode: 17, ctrlKey: false, ...mods });
+  }
 
   /** Keys menu content depends on the remote OS (⌘Tab / Spotlight on a Mac, Ctrl→⌘ only for Mac hosts). */
   function renderCtrlCmdToggle(): void {
@@ -2047,6 +2094,7 @@
     const relevant = remoteMac && currentPlatform !== 'darwin';
     const on = !!currentConfig?.mapCtrlToCmd;
     elBtnViewerCtrlCmd.classList.toggle('hidden', !relevant);
+    elBtnViewerCtrlC.classList.toggle('hidden', !relevant);
     elBtnViewerCtrlCmd.classList.toggle('on', on);
     elBtnViewerCtrlCmd.setAttribute('aria-checked', String(on));
     elKbdAltTab.textContent = remoteMac ? '⌘ + Tab' : 'Alt + Tab';
@@ -2083,6 +2131,12 @@
     const res = await swiftdesk.updateSettings({ viewerCursor: next });
     if (res.config) currentConfig = res.config;
     applyCursorMode(); // menu stays open so the change is visible
+  });
+
+  elBtnViewerCtrlC.addEventListener('click', () => {
+    sendControlC();
+    closeToolbarPopups();
+    elViewerStage.focus();
   });
 
   // --- Toolbar popups (keys menu, custom resolution) ---
@@ -2223,6 +2277,7 @@
       });
     }
     pressedKeys.clear();
+    heldModifierCodes.clear();
     for (const btn of stageButtonsDown) {
       sendRemoteInput({
         type: 'mouseup',
@@ -2282,12 +2337,17 @@
   const CLIPBOARD_POLL_MS = 800;
   const CLIPBOARD_MAX_BYTES = 60_000; // stays well under the DataChannel / MQTT message limits
   let lastClipboardSent = '';
-  let clipboardSyncBusy = false;
+  // The push in progress, if any: a Ctrl+V waits on it (see the keydown handler)
+  let clipboardSyncPromise: Promise<void> | null = null;
 
-  async function syncClipboardToRemote(manual = false): Promise<void> {
-    if (!sessionEstablished || clipboardSyncBusy) return;
-    clipboardSyncBusy = true;
-    try {
+  /**
+   * Pushes this machine's clipboard when it changed since the last push. Unchanged text is never
+   * resent automatically, so something copied ON the remote isn't overwritten by an old local value.
+   */
+  function syncClipboardToRemote(manual = false): Promise<void> {
+    if (!sessionEstablished) return Promise.resolve();
+    if (clipboardSyncPromise) return clipboardSyncPromise;
+    clipboardSyncPromise = (async () => {
       const text: string = (await swiftdesk.readClipboard().catch(() => '')) || '';
       if (!text) {
         if (manual) showToast('Clipboard hiện tại đang trống', 'info');
@@ -2300,11 +2360,14 @@
         return;
       }
       lastClipboardSent = text;
+      // Sent directly, not through the key queue: the keys queued there (the V of a paste) are the ones
+      // waiting for this push, so queueing it behind them would invert the order
       sendRemoteInput({ type: 'clipboard-set', text });
       if (manual) showToast('Đã gửi Clipboard sang máy đích', 'success');
-    } finally {
-      clipboardSyncBusy = false;
-    }
+    })().finally(() => {
+      clipboardSyncPromise = null;
+    });
+    return clipboardSyncPromise;
   }
 
   window.addEventListener('focus', () => {
