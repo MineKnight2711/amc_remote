@@ -248,64 +248,112 @@
 
   <!-- FULLSCREEN / OVERLAY REMOTE DESKTOP VIEWER SESSION -->
   <div id="viewer-overlay" class="viewer-overlay hidden">
-    <!-- Floating Top Control Bar -->
+    <!-- Top Control Bar: one row, never wraps; collapses progressively on narrow windows -->
     <div id="viewer-toolbar" class="viewer-toolbar">
-      <div class="viewer-peer-info">
-        <span class="live-badge">● LIVE</span>
-        <strong id="viewer-host-name">Remote PC</strong>
-        <span id="viewer-host-ip" class="viewer-ip-tag">ID: ---</span>
+      <div class="tb-peer" title="Thiết bị đang điều khiển">
+        <span class="tb-live-dot"></span>
+        <strong id="viewer-host-name" class="tb-host-name">Remote PC</strong>
+        <span id="viewer-host-ip" class="tb-host-id">ID: ---</span>
       </div>
 
       <div class="viewer-stats" id="viewer-stats">
-        <span id="stat-fps">60 FPS</span>
-        <span class="stat-sep">|</span>
-        <span id="stat-ping">1 ms</span>
-        <span class="stat-sep">|</span>
-        <span id="stat-res">1920x1080</span>
+        <span id="stat-path" class="stat-path">--</span>
+        <span id="stat-fps" class="stat-fps">-- FPS</span>
+        <span class="stat-sep stat-extra">·</span>
+        <span id="stat-ping" class="stat-extra">-- ms</span>
+        <span class="stat-sep stat-extra">·</span>
+        <span id="stat-res" class="stat-extra">--</span>
       </div>
 
-      <div class="viewer-controls">
-        <select id="viewer-display-select" class="toolbar-select" title="Chọn màn hình của máy đích">
-          <option value="">Màn hình 1</option>
-        </select>
+      <div class="tb-spacer"></div>
 
-        <select id="viewer-quality-select" class="toolbar-select" title="Đổi tốc độ khung hình / chất lượng">
-          <option value="ultra">60 FPS Ultra</option>
-          <option value="balanced">60 FPS Balanced</option>
-          <option value="low">30 FPS Low</option>
-        </select>
+      <div class="tb-group">
+        <label class="tb-select" title="Màn hình của máy đích">
+          <svg class="tb-ico" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2" /><path d="M8 21h8M12 17v4" /></svg>
+          <select id="viewer-display-select">
+            <option value="">Màn hình 1</option>
+          </select>
+        </label>
 
-        <button id="btn-viewer-scale" class="toolbar-btn" title="Đổi chế độ vừa khung hình / Tỉ lệ 1:1">
-          Vừa màn hình
+        <label class="tb-select" title="Chất lượng hình ảnh / tốc độ khung hình">
+          <svg class="tb-ico" viewBox="0 0 24 24"><path d="M12 14l4-4" /><path d="M3.34 19a10 10 0 1 1 17.32 0" /></svg>
+          <select id="viewer-quality-select">
+            <option value="ultra">Ultra · 60fps</option>
+            <option value="balanced">Cân bằng · 60fps</option>
+            <option value="low">Tiết kiệm · 30fps</option>
+          </select>
+        </label>
+
+        <label class="tb-select" title="Độ phân giải truyền: thấp hơn = mượt hơn và ít tốn băng thông">
+          <svg class="tb-ico" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2" /><path d="M7 12V9h3M17 12v3h-3" /></svg>
+          <select id="viewer-res-select">
+            <option value="display">Theo màn hình</option>
+            <option value="native">Gốc (tối đa)</option>
+            <option value="2560x1440">2560×1440</option>
+            <option value="1920x1080">1920×1080</option>
+            <option value="1600x900">1600×900</option>
+            <option value="1280x720">1280×720</option>
+            <option value="custom">Tuỳ chỉnh…</option>
+          </select>
+        </label>
+      </div>
+
+      <span class="tb-divider"></span>
+
+      <div class="tb-group">
+        <button id="btn-viewer-scale" class="tb-icon-btn" title="Đang: vừa khung hình. Nhấn để xem tỉ lệ 1:1">
+          <svg class="tb-ico" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" /></svg>
         </button>
 
-        <button id="btn-viewer-clipboard" class="toolbar-btn" title="Gửi Clipboard hiện tại sang máy đích">
-          📋 Gửi Clipboard
+        <button id="btn-viewer-clipboard" class="tb-icon-btn" title="Gửi Clipboard của máy này sang máy đích">
+          <svg class="tb-ico" viewBox="0 0 24 24"><rect x="8" y="2" width="8" height="4" rx="1" /><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" /></svg>
         </button>
 
-        <button id="btn-viewer-alttab" class="toolbar-btn" title="Gửi tổ hợp phím Alt + Tab">
-          Alt+Tab
+        <div class="tb-menu-wrap">
+          <button id="btn-viewer-keys" class="tb-icon-btn tb-has-caret" title="Phím tắt & bàn phím">
+            <svg class="tb-ico" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2" /><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10" /></svg>
+            <svg class="tb-caret" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" /></svg>
+          </button>
+          <div id="viewer-keys-menu" class="tb-menu hidden">
+            <button id="btn-viewer-alttab" class="tb-menu-item">
+              <span>Chuyển ứng dụng</span><kbd id="kbd-alttab">Alt + Tab</kbd>
+            </button>
+            <button id="btn-viewer-winkey" class="tb-menu-item">
+              <span>Start / Spotlight</span><kbd id="kbd-winkey">Win</kbd>
+            </button>
+            <button id="btn-viewer-ctrlcmd" class="tb-menu-item hidden" role="switch">
+              <span class="tb-menu-text">
+                Ctrl hoạt động như ⌘
+                <small>Ctrl+C/V/Z → ⌘C/⌘V/⌘Z, phím Win = Control</small>
+              </span>
+              <span class="tb-switch"></span>
+            </button>
+          </div>
+        </div>
+
+        <button id="btn-viewer-fullscreen" class="tb-icon-btn" title="Toàn màn hình (F11)">
+          <svg class="tb-ico" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3" /></svg>
         </button>
 
-        <button id="btn-viewer-winkey" class="toolbar-btn" title="Mở Start Menu / Spotlight (Win/Cmd)">
-          Win/Cmd
+        <button id="btn-viewer-disconnect" class="tb-danger-btn" title="Ngắt kết nối">
+          <svg class="tb-ico" viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0" /><path d="M12 2v10" /></svg>
+          <span class="tb-label">Ngắt kết nối</span>
         </button>
+      </div>
 
-        <button
-          id="btn-viewer-ctrlcmd"
-          class="toolbar-btn hidden"
-          title="BẬT: Ctrl trên máy này = ⌘ Command trên Mac (Ctrl+C/V/Z → ⌘C/⌘V/⌘Z), phím Win = Control. TẮT: giữ nguyên phím."
-        >
-          Ctrl→⌘
-        </button>
-
-        <button id="btn-viewer-fullscreen" class="toolbar-btn" title="Toàn màn hình (F11)">
-          ⛶ Toàn màn hình
-        </button>
-
-        <button id="btn-viewer-disconnect" class="toolbar-btn toolbar-btn-danger">
-          ✕ Ngắt kết nối
-        </button>
+      <!-- Custom resolution popover -->
+      <div id="viewer-res-popover" class="tb-popover hidden">
+        <div class="tb-popover-title">Độ phân giải tuỳ chỉnh</div>
+        <div class="tb-popover-row">
+          <input id="res-custom-w" type="number" min="320" max="7680" step="1" placeholder="Rộng" />
+          <span>×</span>
+          <input id="res-custom-h" type="number" min="240" max="4320" step="1" placeholder="Cao" />
+        </div>
+        <div class="tb-popover-hint">Giữ nguyên tỉ lệ khung hình, không phóng to quá độ phân giải gốc.</div>
+        <div class="tb-popover-actions">
+          <button id="btn-res-custom-cancel" class="tb-text-btn">Huỷ</button>
+          <button id="btn-res-custom-apply" class="tb-primary-btn">Áp dụng</button>
+        </div>
       </div>
     </div>
 

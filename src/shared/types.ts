@@ -43,6 +43,7 @@ export interface AppConfig {
   defaultQuality: QualityPreset;
   allowClipboardSync: boolean;
   mapCtrlToCmd: boolean; // Viewer on Windows/Linux controlling a Mac: Ctrl acts as ⌘ (and Win as Control)
+  viewerResolution: string; // Max stream resolution: 'display' | 'native' | 'WIDTHxHEIGHT'
   savedDevices: SavedDevice[];
   trustedControllers: TrustedController[];
 }

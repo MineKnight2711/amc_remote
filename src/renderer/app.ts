@@ -42,6 +42,7 @@
     defaultQuality: 'ultra' | 'balanced' | 'low';
     allowClipboardSync: boolean;
     mapCtrlToCmd: boolean;
+    viewerResolution: string;
     savedDevices: SavedDevice[];
     trustedControllers: TrustedController[];
   }
@@ -85,6 +86,12 @@
     relayCanvas: HTMLCanvasElement | null;
     lastPointerSeq: number;
     statsTimer: number | null;
+    maxResolution: MaxResolution | null;
+  }
+
+  interface MaxResolution {
+    width: number;
+    height: number;
   }
   const hostPeers = new Map<string, HostPeerSession>();
 
@@ -108,6 +115,8 @@
     fps: number;
     width: number;
     height: number;
+    srcWidth?: number;
+    srcHeight?: number;
     limit: string;
     encoder: string;
     codec: string;
@@ -115,6 +124,7 @@
   let lastDiagnostics = '';
 
   let activeRemoteDisplayId = '';
+  let activeRemoteDisplays: DisplaySourceInfo[] = [];
   let activeRemotePlatform = '';
   let activeRemoteTargetLabel = '';
   let activeRemoteIp = '';
@@ -276,6 +286,17 @@
   const elBtnViewerAltTab = document.getElementById('btn-viewer-alttab')!;
   const elBtnViewerWinKey = document.getElementById('btn-viewer-winkey')!;
   const elBtnViewerCtrlCmd = document.getElementById('btn-viewer-ctrlcmd')!;
+  const elBtnViewerKeys = document.getElementById('btn-viewer-keys')!;
+  const elViewerKeysMenu = document.getElementById('viewer-keys-menu')!;
+  const elKbdAltTab = document.getElementById('kbd-alttab')!;
+  const elKbdWinKey = document.getElementById('kbd-winkey')!;
+  const elStatPath = document.getElementById('stat-path')!;
+  const elViewerResSelect = document.getElementById('viewer-res-select') as HTMLSelectElement;
+  const elResPopover = document.getElementById('viewer-res-popover')!;
+  const elResCustomW = document.getElementById('res-custom-w') as HTMLInputElement;
+  const elResCustomH = document.getElementById('res-custom-h') as HTMLInputElement;
+  const elBtnResCustomApply = document.getElementById('btn-res-custom-apply')!;
+  const elBtnResCustomCancel = document.getElementById('btn-res-custom-cancel')!;
   const elBtnViewerFullscreen = document.getElementById('btn-viewer-fullscreen')!;
   const elBtnViewerDisconnect = document.getElementById('btn-viewer-disconnect')!;
   const elViewerStage = document.getElementById('viewer-stage')!;
@@ -615,10 +636,21 @@
     }
   }
 
-  async function tuneSenderEncoding(
-    sender: RTCRtpSender,
-    quality: 'ultra' | 'balanced' | 'low'
-  ): Promise<void> {
+  /**
+   * Downscale factor that fits the captured frame inside the viewer's max resolution, keeping the
+   * aspect ratio and never upscaling. HiDPI screens are captured in physical pixels (a Mac "looking
+   * like 2560x1440" on a 4K panel streams 3840x2160), which is often far more than the viewer needs.
+   */
+  function resolutionScale(track: MediaStreamTrack | undefined, maxRes: MaxResolution | null): number {
+    if (!track || !maxRes) return 1;
+    const { width, height } = track.getSettings();
+    if (!width || !height) return 1;
+    return Math.max(1, width / maxRes.width, height / maxRes.height);
+  }
+
+  async function tuneSenderEncoding(peer: HostPeerSession): Promise<void> {
+    const sender = peer.videoSender;
+    if (!sender) return;
     try {
       const params = sender.getParameters();
       if (!params.encodings || params.encodings.length === 0) {
@@ -629,9 +661,12 @@
         balanced: 10_000_000, // 10 Mbps
         low: 3_500_000, // 3.5 Mbps
       };
-      params.encodings[0].maxBitrate = bitrateMap[quality] || 20_000_000;
-      params.encodings[0].maxFramerate = quality === 'low' ? 30 : 60;
-      params.encodings[0].scaleResolutionDownBy = 1.0; // Start at 1:1 native resolution
+      params.encodings[0].maxBitrate = bitrateMap[peer.quality] || 20_000_000;
+      params.encodings[0].maxFramerate = peer.quality === 'low' ? 30 : 60;
+      params.encodings[0].scaleResolutionDownBy = resolutionScale(
+        peer.stream?.getVideoTracks()[0],
+        peer.maxResolution
+      );
       await sender.setParameters(params);
     } catch (err) {
       console.warn('[HostWebRTC] Could not set sender encoding parameters:', err);
@@ -698,8 +733,10 @@
         peer.relayInFlight = 0;
       }
 
-      const targetW = peer.quality === 'low' ? 1280 : 1920;
-      const scale = Math.min(1, targetW / video.videoWidth);
+      // JPEG relay is bandwidth-bound: cap at 1920 (1280 for low), and at the viewer's max resolution
+      const targetW = Math.min(peer.quality === 'low' ? 1280 : 1920, peer.maxResolution?.width ?? Infinity);
+      const targetH = peer.maxResolution?.height ?? Infinity;
+      const scale = Math.min(1, targetW / video.videoWidth, targetH / video.videoHeight);
       const w = Math.round(video.videoWidth * scale);
       const h = Math.round(video.videoHeight * scale);
 
@@ -744,6 +781,7 @@
     sourceId: string;
     displayId: string;
     quality: 'ultra' | 'balanced' | 'low';
+    maxResolution?: MaxResolution | null;
   }): Promise<void> {
     const { sessionId, sourceId, displayId, quality } = data;
     cleanupHostSession(sessionId);
@@ -779,7 +817,6 @@
       const videoTrack = stream.getVideoTracks()[0];
       const videoSender = pc.addTrack(videoTrack, stream);
       preferFastScreenCodec(pc, videoSender);
-      await tuneSenderEncoding(videoSender, quality);
 
       const peerSession: HostPeerSession = {
         sessionId,
@@ -802,8 +839,10 @@
         relayCanvas: null,
         lastPointerSeq: 0,
         statsTimer: null,
+        maxResolution: data.maxResolution || null,
       };
       hostPeers.set(sessionId, peerSession);
+      await tuneSenderEncoding(peerSession);
 
       // Share encoder health with the viewer so it can tell CPU/bandwidth limits from network issues
       peerSession.statsTimer = window.setInterval(async () => {
@@ -813,12 +852,15 @@
           stats.forEach((r: any) => {
             if (r.type !== 'outbound-rtp' || r.kind !== 'video') return;
             const codec = r.codecId ? (stats as any).get(r.codecId) : null;
+            const src = peerSession.stream?.getVideoTracks()[0]?.getSettings();
             reliableChannel.send(
               JSON.stringify({
                 type: 'host-stats',
                 fps: r.framesPerSecond || 0,
                 width: r.frameWidth || 0,
                 height: r.frameHeight || 0,
+                srcWidth: src?.width || 0,
+                srcHeight: src?.height || 0,
                 limit: r.qualityLimitationReason || 'none',
                 encoder: r.encoderImplementation || '',
                 codec: codec?.mimeType || '',
@@ -895,7 +937,6 @@
         const newTrack = newStream.getVideoTracks()[0];
         if (peer.videoSender && newTrack) {
           await peer.videoSender.replaceTrack(newTrack);
-          await tuneSenderEncoding(peer.videoSender, peer.quality);
         }
         peer.relayLastDataUrl = '';
         if (peer.relayVideoEl) {
@@ -906,6 +947,8 @@
         }
         peer.stream = newStream;
         peer.activeDisplayId = String(msg.displayId || '');
+        // The new display may have a different capture size: recompute the downscale
+        await tuneSenderEncoding(peer);
       } catch (err) {
         console.error('[HostWebRTC] Error switching display:', err);
       }
@@ -915,9 +958,11 @@
       if (track) {
         applyContentHint(track, msg.quality);
       }
-      if (peer.videoSender) {
-        await tuneSenderEncoding(peer.videoSender, msg.quality);
-      }
+      await tuneSenderEncoding(peer);
+    } else if (msg.type === 'change-resolution') {
+      peer.maxResolution = msg.maxResolution || null;
+      peer.relayLastDataUrl = '';
+      await tuneSenderEncoding(peer);
     }
   }
 
@@ -1142,6 +1187,8 @@
       // CRITICAL: Initialize WebRTC synchronously BEFORE any async await so we NEVER miss webrtc-offer!
       openViewerOverlay(hostInfo, msg.displays || [], clientQuality);
       setupClientWebRTC();
+      // Before client-webrtc-ready, so the host applies it from the very first frame
+      sendResolutionToHost();
       sendClientSignaling({ type: 'client-webrtc-ready' });
 
       // Save device asynchronously in background
@@ -1230,7 +1277,10 @@
           currentPingMs = Math.max(1, Date.now() - data.ts);
           elStatPing.textContent = `${currentPingMs} ms`;
         } else if (data.type === 'host-stats') {
+          const srcChanged =
+            data.srcWidth !== lastHostStats?.srcWidth || data.srcHeight !== lastHostStats?.srcHeight;
           lastHostStats = data;
+          if (srcChanged) renderResolutionSelect(); // "Gốc" label shows the real capture size
         }
       } catch {}
     };
@@ -1334,6 +1384,8 @@
   ): void {
     elViewerHostName.textContent = hostInfo.deviceName || activeRemoteTargetLabel;
     elViewerHostIp.textContent = activeRemoteTargetLabel;
+    // The name is truncated on narrow windows: keep the full name + ID one hover away
+    elViewerHostName.parentElement!.title = `${hostInfo.deviceName || ''} — ${activeRemoteTargetLabel}`;
     activeRemotePlatform = String(hostInfo.platform || '');
     renderCtrlCmdToggle();
     elViewerQualitySelect.value = quality;
@@ -1343,21 +1395,29 @@
     elStatFps.textContent = '-- FPS';
     elStatPing.textContent = '-- ms';
     elStatRes.textContent = '--';
+    setStatPath('--', '');
+    elViewerStats.classList.remove('limited');
     lastDiagnostics = '';
+    closeToolbarPopups();
 
+    activeRemoteDisplays = displays || [];
     elViewerDisplaySelect.innerHTML = '';
-    if (displays && displays.length > 0) {
-      displays.forEach((d, idx) => {
-        const opt = document.createElement('option');
-        opt.value = JSON.stringify({ sourceId: d.id, displayId: d.displayId });
-        opt.textContent = `${d.name} (${d.width}x${d.height})`;
-        if (d.isPrimary || idx === 0) {
-          opt.selected = true;
-          activeRemoteDisplayId = d.displayId;
-        }
-        elViewerDisplaySelect.appendChild(opt);
-      });
-    }
+    activeRemoteDisplays.forEach((d, idx) => {
+      const opt = document.createElement('option');
+      opt.value = JSON.stringify({ sourceId: d.id, displayId: d.displayId });
+      // Size first: it stays readable when the select is truncated on narrow windows
+      opt.textContent =
+        activeRemoteDisplays.length > 1
+          ? `${d.width}×${d.height} · Màn hình ${idx + 1}${d.isPrimary ? ' (chính)' : ''}`
+          : `${d.width}×${d.height}`;
+      opt.title = d.name;
+      if (d.isPrimary || idx === 0) {
+        opt.selected = true;
+        activeRemoteDisplayId = d.displayId;
+      }
+      elViewerDisplaySelect.appendChild(opt);
+    });
+    renderResolutionSelect();
 
     if (clientPingTimer) clearInterval(clientPingTimer);
     clientPingTimer = window.setInterval(() => {
@@ -1388,7 +1448,8 @@
 
       if (!clientHasWebRtcVideo) {
         if (relayFramesCount > 0) {
-          elStatFps.textContent = `${relayFramesCount} FPS (Relay)`;
+          elStatFps.textContent = `${relayFramesCount} FPS`;
+          setStatPath('Relay', 'relay');
         }
         lastDiagnostics = `path=Relay (P2P failed) fps=${relayFramesCount} ping=${currentPingMs}ms | ${iceSummary}`;
         relayFramesCount = 0;
@@ -1419,12 +1480,13 @@
       lastStatsTime = now;
 
       // ⚠ = the host's encoder is throttled by its CPU or by bandwidth, not by the network path
-      const hostLimited = !!lastHostStats && lastHostStats.limit !== 'none';
+      elViewerStats.classList.toggle('limited', !!lastHostStats && lastHostStats.limit !== 'none');
+      setStatPath(pathLabel, pathLabel === 'TURN' ? 'turn' : 'p2p');
       if (fps > 0 && fps <= 144) {
-        elStatFps.textContent = `${fps} FPS (${pathLabel})${hostLimited ? ' ⚠' : ''}`;
+        elStatFps.textContent = `${fps} FPS`;
       }
       if (elRemoteVideo.videoWidth && elRemoteVideo.videoHeight) {
-        elStatRes.textContent = `${elRemoteVideo.videoWidth}x${elRemoteVideo.videoHeight}`;
+        elStatRes.textContent = `${elRemoteVideo.videoWidth}×${elRemoteVideo.videoHeight}`;
       }
 
       const codec = inbound.codecId ? reports.get(inbound.codecId)?.mimeType || '' : '';
@@ -1435,7 +1497,8 @@
         `recv=${inbound.frameWidth || 0}x${inbound.frameHeight || 0} codec=${codec} ` +
         `decoder=${inbound.decoderImplementation || '?'} lost=${inbound.packetsLost || 0} | ` +
         (h
-          ? `host: ${h.fps}fps ${h.width}x${h.height} ${h.codec} encoder=${h.encoder} limit=${h.limit} | `
+          ? `host: ${h.fps}fps ${h.width}x${h.height} (src ${h.srcWidth || '?'}x${h.srcHeight || '?'}) ` +
+            `${h.codec} encoder=${h.encoder} limit=${h.limit} | `
           : 'host: ? | ') +
         iceSummary;
       elViewerStats.title = `${lastDiagnostics}\n(Nhấn để sao chép thông tin chẩn đoán)`;
@@ -1811,12 +1874,16 @@
     if (code) sendKeyEvent('keyup', e, code);
   });
 
+  /** Keys menu content depends on the remote OS (⌘Tab / Spotlight on a Mac, Ctrl→⌘ only for Mac hosts). */
   function renderCtrlCmdToggle(): void {
-    const relevant = activeRemotePlatform === 'darwin' && currentPlatform !== 'darwin';
+    const remoteMac = activeRemotePlatform === 'darwin';
+    const relevant = remoteMac && currentPlatform !== 'darwin';
     const on = !!currentConfig?.mapCtrlToCmd;
     elBtnViewerCtrlCmd.classList.toggle('hidden', !relevant);
-    elBtnViewerCtrlCmd.classList.toggle('active', on);
-    elBtnViewerCtrlCmd.textContent = on ? 'Ctrl→⌘: BẬT' : 'Ctrl→⌘: TẮT';
+    elBtnViewerCtrlCmd.classList.toggle('on', on);
+    elBtnViewerCtrlCmd.setAttribute('aria-checked', String(on));
+    elKbdAltTab.textContent = remoteMac ? '⌘ + Tab' : 'Alt + Tab';
+    elKbdWinKey.textContent = remoteMac ? '⌘' : 'Win';
   }
 
   elBtnViewerCtrlCmd.addEventListener('click', async () => {
@@ -1830,8 +1897,130 @@
         : 'Đã tắt chuyển Ctrl → ⌘ (giữ nguyên phím)',
       'info'
     );
+  });
+
+  // --- Toolbar popups (keys menu, custom resolution) ---
+  function closeToolbarPopups(): void {
+    elViewerKeysMenu.classList.add('hidden');
+    elResPopover.classList.add('hidden');
+  }
+
+  elBtnViewerKeys.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const willOpen = elViewerKeysMenu.classList.contains('hidden');
+    closeToolbarPopups();
+    elViewerKeysMenu.classList.toggle('hidden', !willOpen);
+  });
+
+  document.addEventListener('mousedown', (e) => {
+    const target = e.target as Node;
+    if (elViewerKeysMenu.contains(target) || elBtnViewerKeys.contains(target)) return;
+    if (elResPopover.contains(target) || elViewerResSelect.contains(target)) return;
+    if (!elResPopover.classList.contains('hidden')) renderResolutionSelect(); // dismissing = cancel
+    closeToolbarPopups();
+  });
+
+  function setStatPath(label: string, kind: '' | 'p2p' | 'relay' | 'turn'): void {
+    elStatPath.textContent = label;
+    elStatPath.className = `stat-path ${kind}`.trim();
+  }
+
+  // --- Stream resolution ---
+  const RESOLUTION_PRESETS = ['2560x1440', '1920x1080', '1600x900', '1280x720'];
+
+  function parseResolution(value: string): MaxResolution | null {
+    const m = /^(\d{3,5})x(\d{3,5})$/.exec(value);
+    return m ? { width: Number(m[1]), height: Number(m[2]) } : null;
+  }
+
+  function activeDisplayInfo(): DisplaySourceInfo | undefined {
+    return activeRemoteDisplays.find((d) => d.displayId === activeRemoteDisplayId) || activeRemoteDisplays[0];
+  }
+
+  /** Concrete max size for the host; null = native capture size. */
+  function resolveMaxResolution(): MaxResolution | null {
+    const choice = currentConfig?.viewerResolution || 'display';
+    if (choice === 'native') return null;
+    if (choice === 'display') {
+      // The display's logical size (e.g. 2560x1440 on a 4K HiDPI panel), not its physical pixels
+      const d = activeDisplayInfo();
+      return d ? { width: d.width, height: d.height } : null;
+    }
+    return parseResolution(choice);
+  }
+
+  function sendResolutionToHost(): void {
+    const res = resolveMaxResolution();
+    sendClientSignaling({ type: 'change-resolution', maxWidth: res?.width || 0, maxHeight: res?.height || 0 });
+  }
+
+  function renderResolutionSelect(): void {
+    const choice = currentConfig?.viewerResolution || 'display';
+    const d = activeDisplayInfo();
+    const src = lastHostStats?.srcWidth ? `${lastHostStats.srcWidth}×${lastHostStats.srcHeight}` : '';
+    const opt = (value: string) => elViewerResSelect.querySelector<HTMLOptionElement>(`option[value="${value}"]`);
+    opt('display')!.textContent = d ? `${d.width}×${d.height} · Theo màn hình` : 'Theo màn hình';
+    opt('native')!.textContent = src ? `${src} · Gốc` : 'Gốc (tối đa)';
+
+    // A custom size gets its own option so the select can show it
+    elViewerResSelect.querySelector('option[data-custom-value]')?.remove();
+    if (parseResolution(choice) && !RESOLUTION_PRESETS.includes(choice)) {
+      const custom = document.createElement('option');
+      custom.value = choice;
+      custom.dataset.customValue = '1';
+      custom.textContent = `${choice.replace('x', '×')} · Tuỳ chỉnh`;
+      elViewerResSelect.insertBefore(custom, opt('custom'));
+    }
+    elViewerResSelect.value = choice;
+  }
+
+  async function applyResolutionChoice(choice: string): Promise<void> {
+    const res = await swiftdesk.updateSettings({ viewerResolution: choice });
+    if (res.config) currentConfig = res.config;
+    renderResolutionSelect();
+    sendResolutionToHost();
+    const r = resolveMaxResolution();
+    showToast(r ? `Độ phân giải truyền tối đa: ${r.width} × ${r.height}` : 'Độ phân giải truyền: gốc', 'info');
+    elViewerStage.focus();
+  }
+
+  elViewerResSelect.addEventListener('change', () => {
+    if (elViewerResSelect.value !== 'custom') {
+      applyResolutionChoice(elViewerResSelect.value);
+      return;
+    }
+    const current = resolveMaxResolution() || { width: 1920, height: 1080 };
+    elResCustomW.value = String(current.width);
+    elResCustomH.value = String(current.height);
+    closeToolbarPopups();
+    elResPopover.classList.remove('hidden');
+    elResCustomW.focus();
+    elResCustomW.select();
+  });
+
+  function submitCustomResolution(): void {
+    const w = Math.round(Number(elResCustomW.value));
+    const h = Math.round(Number(elResCustomH.value));
+    if (!(w >= 320 && w <= 7680 && h >= 240 && h <= 4320)) {
+      showToast('Kích thước hợp lệ: rộng 320–7680, cao 240–4320', 'error');
+      return;
+    }
+    elResPopover.classList.add('hidden');
+    applyResolutionChoice(`${w}x${h}`);
+  }
+
+  elBtnResCustomApply.addEventListener('click', submitCustomResolution);
+  elBtnResCustomCancel.addEventListener('click', () => {
+    elResPopover.classList.add('hidden');
+    renderResolutionSelect();
     elViewerStage.focus();
   });
+  for (const input of [elResCustomW, elResCustomH]) {
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitCustomResolution();
+      if (e.key === 'Escape') elBtnResCustomCancel.click();
+    });
+  }
 
   /** Release every key / mouse button still held remotely (focus lost, window hidden, disconnect). */
   function releaseHeldRemoteInputs(): void {
@@ -1875,6 +2064,9 @@
         sourceId: parsed.sourceId,
         displayId: parsed.displayId,
       });
+      // "Theo màn hình" follows the newly selected display's size
+      renderResolutionSelect();
+      sendResolutionToHost();
     } catch {}
   });
 
@@ -1891,7 +2083,10 @@
     isOriginalScale = !isOriginalScale;
     elRemoteVideo.classList.toggle('scale-original', isOriginalScale);
     elRemoteCanvas.classList.toggle('scale-original', isOriginalScale);
-    elBtnViewerScale.textContent = isOriginalScale ? 'Tỉ lệ 1:1' : 'Vừa màn hình';
+    elBtnViewerScale.classList.toggle('active', isOriginalScale);
+    elBtnViewerScale.title = isOriginalScale
+      ? 'Đang: tỉ lệ 1:1. Nhấn để vừa khung hình'
+      : 'Đang: vừa khung hình. Nhấn để xem tỉ lệ 1:1';
   });
 
   elBtnViewerClipboard.addEventListener('click', async () => {
@@ -1915,10 +2110,14 @@
 
   elBtnViewerAltTab.addEventListener('click', () => {
     sendRemoteInput({ type: 'special-combo', combo: 'alt-tab' });
+    closeToolbarPopups();
+    elViewerStage.focus();
   });
 
   elBtnViewerWinKey.addEventListener('click', () => {
     sendRemoteInput({ type: 'special-combo', combo: 'win-key' });
+    closeToolbarPopups();
+    elViewerStage.focus();
   });
 
   elBtnViewerFullscreen.addEventListener('click', () => {

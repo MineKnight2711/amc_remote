@@ -230,6 +230,7 @@ function registerIpcHandlers(): void {
     defaultQuality?: 'ultra' | 'balanced' | 'low';
     allowClipboardSync?: boolean;
     mapCtrlToCmd?: boolean;
+    viewerResolution?: string;
   }) => {
     const current = store.get();
     const portChanged = partial.listenPort !== undefined && partial.listenPort !== current.listenPort;

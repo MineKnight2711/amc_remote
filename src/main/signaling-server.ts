@@ -42,6 +42,8 @@ interface ClientSession {
   authenticated: boolean;
   webrtcStarted: boolean;
   quality: 'ultra' | 'balanced' | 'low';
+  // Viewer-requested max stream resolution (null = native capture size)
+  maxResolution: { width: number; height: number } | null;
   primarySourceId?: string;
   primaryDisplayId?: string;
   controllerId: string;
@@ -187,6 +189,7 @@ export class HostSignalingServer {
           authenticated: false,
           webrtcStarted: false,
           quality: msg.quality || 'ultra',
+          maxResolution: null,
           controllerId: '',
           controllerName: 'Remote Device',
           platform: 'unknown',
@@ -481,6 +484,7 @@ export class HostSignalingServer {
       authenticated: false,
       webrtcStarted: false,
       quality: 'ultra',
+      maxResolution: null,
       controllerId: '',
       controllerName: 'Unknown Device',
       platform: 'unknown',
@@ -535,6 +539,7 @@ export class HostSignalingServer {
       sourceId: session.primarySourceId,
       displayId: session.primaryDisplayId,
       quality: session.quality,
+      maxResolution: session.maxResolution,
       transport: session.transport,
     });
   }
@@ -632,6 +637,18 @@ export class HostSignalingServer {
     }
 
     switch (msg.type) {
+      case 'change-resolution': {
+        // Remembered on the session so it applies even if it arrives before the host's WebRTC starts
+        const w = Math.round(Number(msg.maxWidth));
+        const h = Math.round(Number(msg.maxHeight));
+        session.maxResolution = w >= 160 && h >= 120 && w <= 16384 && h <= 16384 ? { width: w, height: h } : null;
+        this.notifyRenderer('host:signal-from-client', {
+          sessionId: session.sessionId,
+          type: 'change-resolution',
+          maxResolution: session.maxResolution,
+        });
+        break;
+      }
       case 'input': {
         if (msg.event) {
           this.inputController.handleEvent(
