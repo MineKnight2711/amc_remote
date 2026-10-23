@@ -176,6 +176,8 @@ function registerIpcHandlers(): void {
     inputController.releaseAllInputs();
   });
 
+  ipcMain.handle('app:get-input-diagnostics', () => inputController.getDiagnostics());
+
   // Host WebRTC signaling back to connected client (works for both WS and Cloud ID)
   ipcMain.on('host:signal-to-client', (_event, data: { sessionId: string; payload: Record<string, unknown> }) => {
     signalingServer.sendSignalToClient(data.sessionId, data.payload);
@@ -399,7 +401,10 @@ app.whenReady().then(async () => {
   });
 
   store = new ConfigStore(configFileArg);
-  inputController = new InputController();
+  inputController = new InputController(isLoginWindowMode);
+  if (isLoginWindowMode) {
+    console.log(`[Main] Input diagnostics: ${JSON.stringify(inputController.getDiagnostics())}`);
+  }
 
   signalingServer = new HostSignalingServer(store, inputController, () => mainWindow, onSessionsChanged);
 

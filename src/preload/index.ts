@@ -31,6 +31,7 @@ const api = {
   // High-speed fire-and-forget channels for Host WebRTC & Input
   sendHostInputEvent: (ev: RemoteInputEvent) => ipcRenderer.send('host:input-event', ev),
   releaseHostInputs: () => ipcRenderer.send('host:release-inputs'),
+  getInputDiagnostics: () => ipcRenderer.invoke('app:get-input-diagnostics'),
   sendSignalToClient: (sessionId: string, payload: Record<string, unknown>) =>
     ipcRenderer.send('host:signal-to-client', { sessionId, payload }),
 

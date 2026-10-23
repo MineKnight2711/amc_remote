@@ -19,6 +19,7 @@ const INPUT_KEYBOARD = 1;
 
 // macOS CGEvent Constants
 const kCGHIDEventTap = 0;
+const kCGSessionEventTap = 1;
 const kCGEventLeftMouseDown = 1;
 const kCGEventLeftMouseUp = 2;
 const kCGEventRightMouseDown = 3;
@@ -121,13 +122,22 @@ export class InputController {
   private macCFRelease: ((cf: unknown) => void) | null = null;
   private macSetFlags: ((ev: unknown, flags: number) => void) | null = null;
   private macSetUnicodeString: ((ev: unknown, length: number, chars: Uint16Array) => void) | null = null;
+  private macPreflightPostEvent: (() => boolean) | null = null;
+  private macIsSecureInputEnabled: (() => boolean) | null = null;
 
   private lastMousePos = { x: 0, y: 0 };
   private buttonsDown = { left: false, middle: false, right: false };
   // Keys currently held down remotely (code -> keyCode), released if the session ends mid-press
   private keysDown = new Map<string, number>();
+  // Counters only: key identities are never recorded (at the login window they are a password)
+  private keyStats = { received: 0, posted: 0, unmapped: 0 };
 
-  constructor() {
+  /**
+   * @param loginWindow macOS pre-login instance: the password field there runs Secure Event Input,
+   * so keys are posted into the session event stream (as Chrome Remote Desktop does at the login
+   * screen) and carry their Unicode character, instead of relying on the HID tap + layout translation.
+   */
+  constructor(private readonly loginWindow = false) {
     this.initNativeBindings();
   }
 
@@ -196,10 +206,38 @@ export class InputController {
         } catch (err) {
           console.error('[InputController] Failed to bind optional CoreGraphics functions:', err);
         }
+        // Diagnostics only (shown in the viewer's copyable diagnostic line)
+        try {
+          this.macPreflightPostEvent = cg.func('bool CGPreflightPostEventAccess(void)');
+          const carbon = koffi.load('/System/Library/Frameworks/Carbon.framework/Carbon');
+          this.macIsSecureInputEnabled = carbon.func('bool IsSecureEventInputEnabled(void)');
+        } catch (err) {
+          console.warn('[InputController] Input diagnostics unavailable:', err);
+        }
       }
     } catch (err) {
       console.error('[InputController] Failed to load native FFI:', err);
     }
+  }
+
+  /** Why remote keys might not land: permissions, secure input, and whether events got posted. */
+  public getDiagnostics(): Record<string, unknown> {
+    const call = (fn: (() => boolean) | null) => {
+      try {
+        return fn ? fn() : null;
+      } catch {
+        return null;
+      }
+    };
+    return {
+      loginWindow: this.loginWindow,
+      accessibility: process.platform === 'darwin' ? systemPreferences.isTrustedAccessibilityClient(false) : true,
+      postEventAccess: call(this.macPreflightPostEvent),
+      secureInput: call(this.macIsSecureInputEnabled),
+      keysReceived: this.keyStats.received,
+      keysPosted: this.keyStats.posted,
+      keysUnmapped: this.keyStats.unmapped,
+    };
   }
 
   public checkMacPermissions(promptUser = false): { accessibility: boolean; screen: boolean } {
@@ -268,7 +306,8 @@ export class InputController {
         }
         case 'keydown':
         case 'keyup': {
-          this.keyboardEvent(event.code, event.keyCode, event.type === 'keydown', event);
+          this.keyStats.received++;
+          this.keyboardEvent(event.code, event.keyCode, event.type === 'keydown', event, event.key);
           break;
         }
         case 'text': {
@@ -379,7 +418,13 @@ export class InputController {
     }
   }
 
-  private keyboardEvent(code: string, keyCode: number, isDown: boolean, modifiers?: ModifierState): void {
+  private keyboardEvent(
+    code: string,
+    keyCode: number,
+    isDown: boolean,
+    modifiers?: ModifierState,
+    key?: string
+  ): void {
     if (isDown) this.keysDown.set(code, keyCode);
     else this.keysDown.delete(code);
 
@@ -395,7 +440,8 @@ export class InputController {
     } else if (process.platform === 'darwin' && this.macCreateKeyboardEvent && this.macPostEvent && this.macCFRelease) {
       const macVk = CODE_TO_MAC_VK[code];
       if (macVk === undefined) {
-        console.warn(`[InputController] No macOS keycode for "${code}" (keyCode ${keyCode})`);
+        this.keyStats.unmapped++;
+        if (!this.loginWindow) console.warn(`[InputController] No macOS keycode for "${code}" (keyCode ${keyCode})`);
         return;
       }
       const ev = this.macCreateKeyboardEvent(null, macVk, isDown);
@@ -404,8 +450,16 @@ export class InputController {
         // lost (Win/Alt+Tab steal focus on the viewer) stays "held" in macOS, so every letter becomes
         // a ⌘-shortcut and nothing can be typed (⌘Q even quits SwiftDesk itself)
         if (modifiers && this.macSetFlags) this.macSetFlags(ev, macModifierFlags(modifiers));
-        this.macPostEvent(kCGHIDEventTap, ev);
+        const plainChar =
+          !!key && [...key].length === 1 && !modifiers?.ctrlKey && !modifiers?.metaKey && !modifiers?.altKey;
+        if (this.loginWindow && plainChar && this.macSetUnicodeString) {
+          // Carry the character itself: no dependence on the login window's layout translation
+          const units = Uint16Array.from({ length: key!.length }, (_, i) => key!.charCodeAt(i));
+          this.macSetUnicodeString(ev, units.length, units);
+        }
+        this.macPostEvent(this.loginWindow ? kCGSessionEventTap : kCGHIDEventTap, ev);
         this.macCFRelease(ev);
+        this.keyStats.posted++;
       }
     }
   }

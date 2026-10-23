@@ -120,8 +120,20 @@
     limit: string;
     encoder: string;
     codec: string;
+    input?: Record<string, unknown> | null;
   } | null = null;
   let lastDiagnostics = '';
+
+  /** e.g. "input[loginWindow ax=1 post=1 secure=1 keys=12/12 unmapped=0]" */
+  function formatInputDiagnostics(input: Record<string, unknown> | null | undefined): string {
+    if (!input) return 'input[?]';
+    const b = (v: unknown) => (v === true ? '1' : v === false ? '0' : '?');
+    return (
+      `input[${input.loginWindow ? 'loginWindow ' : ''}ax=${b(input.accessibility)} ` +
+      `post=${b(input.postEventAccess)} secure=${b(input.secureInput)} ` +
+      `keys=${input.keysPosted}/${input.keysReceived} unmapped=${input.keysUnmapped}]`
+    );
+  }
 
   let activeRemoteDisplayId = '';
   let activeRemoteDisplays: DisplaySourceInfo[] = [];
@@ -849,6 +861,7 @@
         if (reliableChannel.readyState !== 'open') return;
         try {
           const stats = await pc.getStats();
+          const input = await swiftdesk.getInputDiagnostics().catch(() => null);
           stats.forEach((r: any) => {
             if (r.type !== 'outbound-rtp' || r.kind !== 'video') return;
             const codec = r.codecId ? (stats as any).get(r.codecId) : null;
@@ -864,6 +877,7 @@
                 limit: r.qualityLimitationReason || 'none',
                 encoder: r.encoderImplementation || '',
                 codec: codec?.mimeType || '',
+                input,
               })
             );
           });
@@ -1604,7 +1618,7 @@
         `decoder=${inbound.decoderImplementation || '?'} lost=${inbound.packetsLost || 0} | ` +
         (h
           ? `host: ${h.fps}fps ${h.width}x${h.height} (src ${h.srcWidth || '?'}x${h.srcHeight || '?'}) ` +
-            `${h.codec} encoder=${h.encoder} limit=${h.limit} | `
+            `${h.codec} encoder=${h.encoder} limit=${h.limit} ${formatInputDiagnostics(h.input)} | `
           : 'host: ? | ') +
         iceSummary;
       elViewerStats.title = `${lastDiagnostics}\n(Nhấn để sao chép thông tin chẩn đoán)`;
