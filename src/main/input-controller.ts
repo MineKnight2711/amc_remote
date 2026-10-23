@@ -1,3 +1,4 @@
+import * as fs from 'fs';
 import { screen, clipboard, systemPreferences } from 'electron';
 import { RemoteInputEvent } from '../shared/types';
 
@@ -140,13 +141,44 @@ export class InputController {
   // Counters only: key identities are never recorded (at the login window they are a password)
   private keyStats = { received: 0, posted: 0, unmapped: 0, viaHidSource: 0 };
 
+  // Crash guard for the experimental login-window key path: a marker file is written right before the
+  // first native key post of a session and deleted once the process has stayed up a few seconds. If a
+  // post segfaults (killing the process so JS try/catch can't help), the marker survives, and the next
+  // launchd restart runs with the key path disabled — mouse and viewing still work, no crash loop.
+  private keyInjectState: 'idle' | 'armed' | 'stable' | 'disabled' = 'idle';
+  private keyInjectArmed = false;
+
   /**
-   * @param loginWindow macOS pre-login instance: the password field there runs Secure Event Input,
-   * so keys are posted into the session event stream (as Chrome Remote Desktop does at the login
-   * screen) and carry their Unicode character, instead of relying on the HID tap + layout translation.
+   * @param loginWindow macOS pre-login instance (runs as root at the login screen).
+   * @param crashGuardFile marker path used to disable the login-window key path after a crash.
    */
-  constructor(private readonly loginWindow = false) {
+  constructor(private readonly loginWindow = false, private readonly crashGuardFile?: string) {
     this.initNativeBindings();
+    if (loginWindow && crashGuardFile) {
+      try {
+        if (fs.existsSync(crashGuardFile)) {
+          // Previous login-window instance crashed while sending a key: run without it this time
+          this.keyInjectState = 'disabled';
+          fs.unlinkSync(crashGuardFile); // let the next launch try again
+          console.warn('[InputController] Login-window key path disabled after a previous crash');
+        }
+      } catch {}
+    }
+  }
+
+  private armKeyInjectGuard(): void {
+    if (this.keyInjectArmed || !this.crashGuardFile) return;
+    this.keyInjectArmed = true;
+    this.keyInjectState = 'armed';
+    try {
+      fs.writeFileSync(this.crashGuardFile, new Date().toISOString());
+    } catch {}
+    setTimeout(() => {
+      try {
+        if (this.crashGuardFile) fs.unlinkSync(this.crashGuardFile);
+      } catch {}
+      if (this.keyInjectState === 'armed') this.keyInjectState = 'stable';
+    }, 4000);
   }
 
   private initNativeBindings(): void {
@@ -257,6 +289,7 @@ export class InputController {
       keysUnmapped: this.keyStats.unmapped,
       keysViaHidSource: this.keyStats.viaHidSource,
       eventSource: this.loginWindow ? (this.hidSystemEventSource() ? 'hid' : 'none') : 'default',
+      keyInject: this.keyInjectState,
       mouse: this.mouseBoundsSource,
     };
   }
@@ -492,9 +525,13 @@ export class InputController {
       }
 
       // Login window: create the key from the HID-system-state event source and post it at the HID tap,
-      // the way RustDesk does (it can type into that password field). Keys created without a source
-      // (NULL) never reached it, whatever the tap or target process.
-      const source = this.loginWindow ? this.hidSystemEventSource() : null;
+      // the way RustDesk does. Keys created without a source (NULL) never reached the login screen.
+      // Gated behind the crash guard so a native fault here cannot crash-loop the login-window instance.
+      let source: unknown = null;
+      if (this.loginWindow && this.keyInjectState !== 'disabled') {
+        this.armKeyInjectGuard();
+        source = this.hidSystemEventSource();
+      }
 
       const ev = this.macCreateKeyboardEvent(source, macVk, isDown);
       if (ev) {

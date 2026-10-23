@@ -401,7 +401,10 @@ app.whenReady().then(async () => {
   });
 
   store = new ConfigStore(configFileArg);
-  inputController = new InputController(isLoginWindowMode);
+  const crashGuardFile = isLoginWindowMode
+    ? path.join(app.getPath('userData'), 'loginwindow-keyinject.crashguard')
+    : undefined;
+  inputController = new InputController(isLoginWindowMode, crashGuardFile);
   if (isLoginWindowMode) {
     console.log(`[Main] Input diagnostics: ${JSON.stringify(inputController.getDiagnostics())}`);
   }

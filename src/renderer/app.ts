@@ -132,7 +132,8 @@
       `input[${input.loginWindow ? 'loginWindow ' : ''}ax=${b(input.accessibility)} ` +
       `post=${b(input.postEventAccess)} secure=${b(input.secureInput)} ` +
       `keys=${input.keysPosted}/${input.keysReceived} unmapped=${input.keysUnmapped} ` +
-      `viaHidSrc=${input.keysViaHidSource ?? '?'} src=${input.eventSource ?? '?'} mouse=${input.mouse ?? '?'}]`
+      `viaHidSrc=${input.keysViaHidSource ?? '?'} src=${input.eventSource ?? '?'} ` +
+      `inject=${input.keyInject ?? '?'} mouse=${input.mouse ?? '?'}]`
     );
   }
 
