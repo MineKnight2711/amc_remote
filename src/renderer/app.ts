@@ -1315,6 +1315,9 @@
       cancelReconnect();
       sessionEstablished = true;
       noteHostActivity();
+      // New session: push the current clipboard once the channels are up
+      lastClipboardSent = '';
+      window.setTimeout(() => syncClipboardToRemote(), 1500);
       elBtnConnectNow.disabled = false;
       elConnectStatusMsg.textContent = '';
 
@@ -1897,6 +1900,7 @@
       button: mapMouseButton(e.button),
       x: coords.x,
       y: coords.y,
+      clickCount: e.detail || 1, // browser's click number: 2 = double-click
       ...remoteModifiers(e),
     });
   });
@@ -1911,6 +1915,7 @@
       button: mapMouseButton(e.button),
       x: coords.x,
       y: coords.y,
+      clickCount: e.detail || 1,
       ...remoteModifiers(e),
     });
   });
@@ -2270,17 +2275,47 @@
       : 'Đang: vừa khung hình. Nhấn để xem tỉ lệ 1:1';
   });
 
-  elBtnViewerClipboard.addEventListener('click', async () => {
-    const text = await swiftdesk.readClipboard();
-    if (text) {
-      sendRemoteInput({
-        type: 'clipboard-set',
-        text,
-      });
-      showToast('Đã đồng bộ Clipboard sang máy đích', 'success');
-    } else {
-      showToast('Clipboard hiện tại đang trống', 'info');
+  // --- Clipboard: this machine -> remote ---
+  // Copy here, paste there: the local clipboard is pushed to the host whenever it changes while the
+  // viewer has focus, and right when the viewer regains focus (after copying in another app). The host
+  // applies it only if its "clipboard sync" setting is on.
+  const CLIPBOARD_POLL_MS = 800;
+  const CLIPBOARD_MAX_BYTES = 60_000; // stays well under the DataChannel / MQTT message limits
+  let lastClipboardSent = '';
+  let clipboardSyncBusy = false;
+
+  async function syncClipboardToRemote(manual = false): Promise<void> {
+    if (!sessionEstablished || clipboardSyncBusy) return;
+    clipboardSyncBusy = true;
+    try {
+      const text: string = (await swiftdesk.readClipboard().catch(() => '')) || '';
+      if (!text) {
+        if (manual) showToast('Clipboard hiện tại đang trống', 'info');
+        return;
+      }
+      if (!manual && text === lastClipboardSent) return;
+      if (new TextEncoder().encode(text).length > CLIPBOARD_MAX_BYTES) {
+        if (manual || text !== lastClipboardSent) showToast('Nội dung clipboard quá lớn để gửi (tối đa ~60KB)', 'error');
+        lastClipboardSent = text;
+        return;
+      }
+      lastClipboardSent = text;
+      sendRemoteInput({ type: 'clipboard-set', text });
+      if (manual) showToast('Đã gửi Clipboard sang máy đích', 'success');
+    } finally {
+      clipboardSyncBusy = false;
     }
+  }
+
+  window.addEventListener('focus', () => {
+    syncClipboardToRemote();
+  });
+  window.setInterval(() => {
+    if (document.hasFocus()) syncClipboardToRemote();
+  }, CLIPBOARD_POLL_MS);
+
+  elBtnViewerClipboard.addEventListener('click', () => {
+    syncClipboardToRemote(true);
   });
 
   elViewerStats.addEventListener('click', async () => {

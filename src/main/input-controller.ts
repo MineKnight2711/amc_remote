@@ -20,6 +20,10 @@ const INPUT_KEYBOARD = 1;
 
 // macOS CGEvent Constants
 const kCGHIDEventTap = 0;
+// macOS only recognizes a double-click when the mouse events carry the click number in this field
+const kCGMouseEventClickState = 1;
+const DOUBLE_CLICK_MS = 500;
+const DOUBLE_CLICK_SLOP_PX = 5;
 // Login window keys are created from this event source (see keyboardEvent)
 const kCGEventSourceStateHIDSystemState = 1;
 const kCGEventLeftMouseDown = 1;
@@ -123,6 +127,8 @@ export class InputController {
   private macPostEvent: ((tap: number, ev: unknown) => void) | null = null;
   private macCFRelease: ((cf: unknown) => void) | null = null;
   private macSetFlags: ((ev: unknown, flags: number) => void) | null = null;
+  private macSetIntegerField: ((ev: unknown, field: number, value: number) => void) | null = null;
+  private lastClick = { button: '', at: 0, x: 0, y: 0, count: 0 };
   private macSetUnicodeString: ((ev: unknown, length: number, chars: Uint16Array) => void) | null = null;
   private macPreflightPostEvent: (() => boolean) | null = null;
   private macIsSecureInputEnabled: (() => boolean) | null = null;
@@ -251,6 +257,7 @@ export class InputController {
           this.macSetUnicodeString = cg.func(
             'void CGEventKeyboardSetUnicodeString(void* event, unsigned long stringLength, const uint16_t* unicodeString)'
           );
+          this.macSetIntegerField = cg.func('void CGEventSetIntegerValueField(void* event, uint32_t field, int64_t value)');
         } catch (err) {
           console.error('[InputController] Failed to bind optional CoreGraphics functions:', err);
         }
@@ -390,7 +397,9 @@ export class InputController {
           const pt = this.resolveScreenCoordinates(event.x, event.y, event.displayId);
           this.lastMousePos = pt;
           this.moveMouse(pt.x, pt.y);
-          this.mouseButton(event.button, event.type === 'mousedown', pt.x, pt.y, event);
+          const isDown = event.type === 'mousedown';
+          const clickCount = this.resolveClickCount(event.button, isDown, pt, event.clickCount);
+          this.mouseButton(event.button, isDown, pt.x, pt.y, event, clickCount);
           break;
         }
         case 'wheel': {
@@ -449,12 +458,38 @@ export class InputController {
     }
   }
 
+  /**
+   * Click number for this press (1, 2 = double-click, 3 = triple). Taken from the viewer's
+   * MouseEvent.detail when present, otherwise derived here from timing and distance.
+   */
+  private resolveClickCount(
+    button: string,
+    isDown: boolean,
+    pt: { x: number; y: number },
+    fromViewer?: number
+  ): number {
+    if (!isDown) return this.lastClick.button === button ? this.lastClick.count || 1 : 1;
+    const now = Date.now();
+    let count: number;
+    if (typeof fromViewer === 'number' && fromViewer > 0) {
+      count = Math.min(3, Math.round(fromViewer));
+    } else {
+      const near =
+        Math.abs(pt.x - this.lastClick.x) <= DOUBLE_CLICK_SLOP_PX && Math.abs(pt.y - this.lastClick.y) <= DOUBLE_CLICK_SLOP_PX;
+      const sameClick = this.lastClick.button === button && now - this.lastClick.at < DOUBLE_CLICK_MS && near;
+      count = sameClick ? Math.min(3, this.lastClick.count + 1) : 1;
+    }
+    this.lastClick = { button, at: now, x: pt.x, y: pt.y, count };
+    return count;
+  }
+
   private mouseButton(
     button: 'left' | 'middle' | 'right',
     isDown: boolean,
     x: number,
     y: number,
-    modifiers?: ModifierState
+    modifiers?: ModifierState,
+    clickCount = 1
   ): void {
     this.buttonsDown[button] = isDown;
 
@@ -483,6 +518,8 @@ export class InputController {
       const ev = this.macCreateMouseEvent(null, type, { x, y }, btnIndex);
       if (ev) {
         if (modifiers && this.macSetFlags) this.macSetFlags(ev, macModifierFlags(modifiers));
+        // Without the click number every press is a single click, so double-click never happened
+        if (this.macSetIntegerField) this.macSetIntegerField(ev, kCGMouseEventClickState, clickCount);
         this.macPostEvent(kCGHIDEventTap, ev);
         this.macCFRelease(ev);
       }

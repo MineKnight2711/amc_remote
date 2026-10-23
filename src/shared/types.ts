@@ -75,6 +75,7 @@ export type RemoteInputEvent =
       y: number;
       displayId?: string;
       seq?: number;
+      clickCount?: number; // 1 = single, 2 = second click of a double-click (MouseEvent.detail)
       ctrlKey?: boolean;
       shiftKey?: boolean;
       altKey?: boolean;
