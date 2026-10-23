@@ -124,16 +124,22 @@
   } | null = null;
   let lastDiagnostics = '';
 
-  /** e.g. "input[loginWindow ax=1 post=1 secure=1 keys=12/12 unmapped=0]" */
+  /** e.g. "input[loginWindow ax=1 post=1 secure=1 keys=12/12 unmapped=0 hid=ok viaHid=12 kbd=40]" */
   function formatInputDiagnostics(input: Record<string, unknown> | null | undefined): string {
     if (!input) return 'input[?]';
     const b = (v: unknown) => (v === true ? '1' : v === false ? '0' : '?');
     return (
       `input[${input.loginWindow ? 'loginWindow ' : ''}ax=${b(input.accessibility)} ` +
       `post=${b(input.postEventAccess)} secure=${b(input.secureInput)} ` +
-      `keys=${input.keysPosted}/${input.keysReceived} unmapped=${input.keysUnmapped}]`
+      `keys=${input.keysPosted}/${input.keysReceived} unmapped=${input.keysUnmapped} ` +
+      `hid=${input.hid ?? '?'} viaHid=${input.keysViaHid ?? '?'} kbd=${input.kbdType ?? '?'}]`
     );
   }
+
+  // Host-side WebRTC/input state sent over signaling while P2P is down (relay), so the diagnostic
+  // line still explains what is happening on the host
+  let lastHostDiag: { ice?: string; gathering?: string; localCands?: string; input?: Record<string, unknown> } | null =
+    null;
 
   let activeRemoteDisplayId = '';
   let activeRemoteDisplays: DisplaySourceInfo[] = [];
@@ -819,8 +825,10 @@
 
       const sendIce = (candidate: RTCIceCandidateInit) =>
         swiftdesk.sendSignalToClient(sessionId, { type: 'webrtc-ice', candidate });
+      const gatheredKinds = new Set<string>(); // for diagnostics, e.g. "host6 srflx4"
       pc.onicecandidate = (event) => {
         if (event.candidate) {
+          gatheredKinds.add(`${event.candidate.type}${String(event.candidate.address || '').includes(':') ? '6' : '4'}`);
           sendIce(event.candidate.toJSON());
           advertiseUpnpCandidate(`host:${sessionId}`, event.candidate, sendIce);
         }
@@ -858,10 +866,20 @@
 
       // Share encoder health with the viewer so it can tell CPU/bandwidth limits from network issues
       peerSession.statsTimer = window.setInterval(async () => {
-        if (reliableChannel.readyState !== 'open') return;
+        const input = await swiftdesk.getInputDiagnostics().catch(() => null);
+        if (reliableChannel.readyState !== 'open') {
+          // P2P is down (frame relay): report over the signaling path instead
+          swiftdesk.sendSignalToClient(sessionId, {
+            type: 'host-diag',
+            ice: pc.iceConnectionState,
+            gathering: pc.iceGatheringState,
+            localCands: [...gatheredKinds].sort().join(' ') || 'none',
+            input,
+          });
+          return;
+        }
         try {
           const stats = await pc.getStats();
-          const input = await swiftdesk.getInputDiagnostics().catch(() => null);
           stats.forEach((r: any) => {
             if (r.type !== 'outbound-rtp' || r.kind !== 'video') return;
             const codec = r.codecId ? (stats as any).get(r.codecId) : null;
@@ -1232,6 +1250,12 @@
       clientConnectTimer = null;
     }
 
+    if (msg.type === 'host-diag') {
+      noteHostActivity();
+      lastHostDiag = msg;
+      return;
+    }
+
     if (msg.type === 'pong' && msg.ts) {
       noteHostActivity();
       currentPingMs = Math.max(1, Date.now() - msg.ts);
@@ -1410,6 +1434,7 @@
     clientRemoteDescSet = false;
     clientPendingIce = [];
     lastHostStats = null;
+    lastHostDiag = null;
     elRemoteVideo.classList.remove('hidden');
     elRemoteCanvas.classList.add('hidden');
 
@@ -1570,7 +1595,12 @@
           elStatFps.textContent = `${relayFramesCount} FPS`;
           setStatPath('Relay', 'relay');
         }
-        lastDiagnostics = `path=Relay (P2P failed) fps=${relayFramesCount} ping=${currentPingMs}ms | ${iceSummary}`;
+        const hd = lastHostDiag;
+        lastDiagnostics =
+          `path=Relay (P2P failed) fps=${relayFramesCount} ping=${currentPingMs}ms | ${iceSummary} | ` +
+          (hd
+            ? `host: ice=${hd.ice} gathering=${hd.gathering} local[${hd.localCands}] ${formatInputDiagnostics(hd.input)}`
+            : 'host: ?');
         relayFramesCount = 0;
         elViewerStats.title = `${lastDiagnostics}\n(Nhấn để sao chép thông tin chẩn đoán)`;
         return;
