@@ -33,10 +33,18 @@ export class ConfigStore {
   private filePath: string;
   private config: AppConfig;
 
-  constructor() {
-    const userDataPath = app.getPath('userData');
-    fs.mkdirSync(userDataPath, { recursive: true });
-    this.filePath = path.join(userDataPath, 'swiftdesk-config.json');
+  /**
+   * @param filePathOverride Explicit config file. The macOS login-window instance runs as root before
+   * anyone logs in, and must reuse the logged-out user's config (same Cloud ID, password, trusted devices).
+   */
+  constructor(filePathOverride?: string) {
+    if (filePathOverride) {
+      this.filePath = filePathOverride;
+    } else {
+      const userDataPath = app.getPath('userData');
+      fs.mkdirSync(userDataPath, { recursive: true });
+      this.filePath = path.join(userDataPath, 'swiftdesk-config.json');
+    }
     this.config = this.loadOrInit();
   }
 

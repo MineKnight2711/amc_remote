@@ -360,9 +360,12 @@ export class HostSignalingServer {
 
   public async stop(): Promise<void> {
     for (const session of this.sessions.values()) {
+      // The host app is quitting (restart, update, or the macOS login-window instance handing over
+      // to the user's own instance after login): tell viewers to reconnect rather than give up
       this.sendToSession(session, {
         type: 'session-closed',
-        reason: 'Máy chủ đã dừng phiên kết nối.',
+        reason: 'SwiftDesk trên máy đích đang khởi động lại, đang kết nối lại...',
+        reconnect: true,
       });
       if (session.ws) {
         try {
@@ -374,8 +377,16 @@ export class HostSignalingServer {
     this.inputController.releaseAllInputs();
     await this.stopLocalServer();
     if (this.mqttClient) {
-      this.mqttClient.end(true);
+      // Graceful end flushes the "session-closed" messages queued above
+      const client = this.mqttClient;
       this.mqttClient = null;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 1000);
+        client.end(false, {}, () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
     }
   }
 
@@ -396,12 +407,14 @@ export class HostSignalingServer {
     return list;
   }
 
-  public disconnectSession(sessionId: string): void {
+  /** @param reconnect Host-side failure (not a deliberate kick): the viewer should come back. */
+  public disconnectSession(sessionId: string, reconnect = false): void {
     const s = this.sessions.get(sessionId);
     if (s) {
       this.sendToSession(s, {
         type: 'session-closed',
-        reason: 'Máy chủ đã ngắt kết nối phiên này.',
+        reason: reconnect ? 'Máy đích gặp sự cố, đang khôi phục...' : 'Máy chủ đã ngắt kết nối phiên này.',
+        reconnect,
       });
       if (s.ws) {
         try {
@@ -440,7 +453,7 @@ export class HostSignalingServer {
   /** Ends every authenticated session (used when the host renderer dies). */
   public disconnectAllSessions(): void {
     for (const s of [...this.sessions.values()]) {
-      if (s.authenticated) this.disconnectSession(s.sessionId);
+      if (s.authenticated) this.disconnectSession(s.sessionId, true);
     }
   }
 

@@ -6,7 +6,9 @@
   "scripts": {
     "build": "tsc && node scripts/copy-assets.js",
     "start": "npm run build && node scripts/start-app.js",
-    "dev": "npm run build && node scripts/start-app.js"
+    "dev": "npm run build && node scripts/start-app.js",
+    "mac:loginwindow": "sudo bash scripts/mac-loginwindow.sh install",
+    "mac:loginwindow:uninstall": "sudo bash scripts/mac-loginwindow.sh uninstall"
   },
   "keywords": [
     "remote-desktop",

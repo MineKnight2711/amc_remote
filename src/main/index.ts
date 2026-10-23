@@ -1,4 +1,6 @@
+import * as fs from 'fs';
 import * as path from 'path';
+import { execFile } from 'child_process';
 import {
   app,
   BrowserWindow,
@@ -45,6 +47,25 @@ const upnpMapper = new UpnpPortMapper();
 const isMultiInstanceAllowed = process.argv.includes('--multi-instance');
 const isAutoStarted = process.argv.includes('--autostart');
 
+// macOS pre-login instance, started at the login window (after a restart, or after logging out) by
+// /Library/LaunchAgents/com.swiftdesk.remote.loginwindow.plist. It runs as root, so it gets its own
+// Chromium profile and log folder, but reuses the user's config (same Cloud ID / password).
+const isLoginWindowMode = process.platform === 'darwin' && process.argv.includes('--login-window');
+const configFileArg = process.argv.find((a) => a.startsWith('--config-file='))?.slice('--config-file='.length);
+if (isLoginWindowMode) {
+  app.setPath('userData', '/Library/Application Support/SwiftDesk/loginwindow');
+  app.setAppLogsPath('/Library/Logs/SwiftDesk');
+}
+
+/** At the login window /dev/console belongs to root; once someone logs in it belongs to that user. */
+function isUserLoggedIn(): boolean {
+  try {
+    return fs.statSync('/dev/console').uid !== 0;
+  } catch {
+    return false;
+  }
+}
+
 if (!isMultiInstanceAllowed) {
   const gotLock = app.requestSingleInstanceLock();
   if (!gotLock) {
@@ -79,7 +100,7 @@ function createMainWindow(): void {
     title: 'SwiftDesk Remote Desktop',
     backgroundColor: '#090d16',
     autoHideMenuBar: true,
-    show: !isAutoStarted,
+    show: !isAutoStarted && !isLoginWindowMode,
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'index.js'),
       contextIsolation: true,
@@ -250,7 +271,7 @@ function registerIpcHandlers(): void {
       serverResult = await signalingServer.start(partial.listenPort);
     }
 
-    trayManager.refreshMenu();
+    trayManager?.refreshMenu();
     return {
       success: serverResult.success,
       error: serverResult.error,
@@ -332,9 +353,43 @@ app.on('child-process-gone', (_e, details) => {
   );
 });
 
+let displayAwakeId: number | null = null;
+let lastSessionCount = 0;
+
+/**
+ * While someone is connected keep the host's display on, and wake it when a session starts:
+ * a sleeping display streams black, and a locked Mac couldn't be unlocked remotely.
+ */
+function onSessionsChanged(): void {
+  trayManager?.refreshMenu();
+  const count = signalingServer.getActiveSessions().length;
+  if (count > lastSessionCount && process.platform === 'darwin') {
+    // -u declares user activity: turns a sleeping display back on
+    execFile('/usr/bin/caffeinate', ['-u', '-t', '5'], () => {});
+  }
+  if (count > 0 && displayAwakeId === null) {
+    displayAwakeId = powerSaveBlocker.start('prevent-display-sleep');
+  } else if (count === 0 && displayAwakeId !== null) {
+    powerSaveBlocker.stop(displayAwakeId);
+    displayAwakeId = null;
+  }
+  lastSessionCount = count;
+}
+
 app.whenReady().then(async () => {
   const logPath = initFileLogger();
   console.log(`[Main] Writing log to ${logPath}`);
+
+  if (isLoginWindowMode) {
+    if (isUserLoggedIn()) {
+      // A user session is active: that session's own SwiftDesk instance serves it
+      console.log('[Main] Login-window instance started while a user is logged in, exiting');
+      app.exit(0);
+      return;
+    }
+    console.log(`[Main] Login-window mode (before login), config: ${configFileArg || '(default)'}`);
+  }
+
   powerSaveId = powerSaveBlocker.start('prevent-app-suspension');
 
   session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
@@ -343,44 +398,50 @@ app.whenReady().then(async () => {
     });
   });
 
-  store = new ConfigStore();
+  store = new ConfigStore(configFileArg);
   inputController = new InputController();
 
-  signalingServer = new HostSignalingServer(
-    store,
-    inputController,
-    () => mainWindow,
-    () => trayManager?.refreshMenu()
-  );
-
-  trayManager = new TrayManager(
-    () => showMainWindow(),
-    () => {
-      isQuitting = true;
-    },
-    () => ({
-      port: store.get().listenPort,
-      activeCount: signalingServer.getActiveSessions().length,
-      autoStart: store.get().autoStart,
-    }),
-    async (enabled) => {
-      await AutoStartManager.setAutoStart(enabled);
-      store.save({ autoStart: enabled });
-      trayManager.refreshMenu();
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('app:config-updated', store.get());
-      }
-    }
-  );
+  signalingServer = new HostSignalingServer(store, inputController, () => mainWindow, onSessionsChanged);
 
   registerIpcHandlers();
   createMainWindow();
-  trayManager.init();
 
-  await AutoStartManager.setAutoStart(store.get().autoStart);
-  AutoStartManager.ensureWindowsShortcuts();
+  if (isLoginWindowMode) {
+    // Hand over to the user's own instance (started by their LaunchAgent) as soon as someone logs in.
+    // Quitting sends "session-closed" with reconnect=true, so the viewer reconnects to the new instance.
+    setInterval(() => {
+      if (isUserLoggedIn() && !isQuitting) {
+        console.log('[Main] User logged in, login-window instance handing over and exiting');
+        app.quit();
+      }
+    }, 1500);
+  } else {
+    trayManager = new TrayManager(
+      () => showMainWindow(),
+      () => {
+        isQuitting = true;
+      },
+      () => ({
+        port: store.get().listenPort,
+        activeCount: signalingServer.getActiveSessions().length,
+        autoStart: store.get().autoStart,
+      }),
+      async (enabled) => {
+        await AutoStartManager.setAutoStart(enabled);
+        store.save({ autoStart: enabled });
+        trayManager.refreshMenu();
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('app:config-updated', store.get());
+        }
+      }
+    );
+    trayManager.init();
+    await AutoStartManager.setAutoStart(store.get().autoStart);
+    AutoStartManager.ensureWindowsShortcuts();
+  }
+
   await signalingServer.start(store.get().listenPort);
-  trayManager.refreshMenu();
+  trayManager?.refreshMenu();
   upnpMapper.warmUp();
 
   app.on('activate', () => {

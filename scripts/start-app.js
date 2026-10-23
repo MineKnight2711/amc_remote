@@ -115,11 +115,25 @@ if (process.platform !== 'darwin') {
     execSync('pkill -f "SwiftDesk.app/Contents/MacOS" || true', { stdio: 'ignore' });
   } catch {}
 
+  // With the login-window agent installed (scripts/mac-loginwindow.sh), /Applications/SwiftDesk.app is
+  // the copy macOS runs at the login screen: keep it current and run that one, so both share one app
+  let appToLaunch = swiftDeskApp;
+  const installedApp = '/Applications/SwiftDesk.app';
+  if (fs.existsSync(path.join(installedApp, 'Contents', 'Resources', 'app', 'package.json'))) {
+    try {
+      execSync(`rsync -a --delete "${swiftDeskApp}/" "${installedApp}/"`);
+      appToLaunch = installedApp;
+      console.log('[SwiftDesk macOS] Updated /Applications/SwiftDesk.app (login-window agent installed)');
+    } catch (err) {
+      console.warn('[SwiftDesk macOS] Could not update /Applications/SwiftDesk.app:', err.message);
+    }
+  }
+
   console.log('[SwiftDesk macOS] Launching standalone SwiftDesk.app via macOS LaunchServices...');
   console.log(
     '[SwiftDesk macOS] Quyền Accessibility & Screen Recording sẽ được cấp riêng cho app "SwiftDesk" (không phải VS Code)!'
   );
 
   // Launch via `open -a` so macOS WindowServer/launchd owns the process, NOT VS Code!
-  execSync(`open -n -a "${swiftDeskApp}"`, { stdio: 'inherit' });
+  execSync(`open -n -a "${appToLaunch}"`, { stdio: 'inherit' });
 }

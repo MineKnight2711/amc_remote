@@ -996,12 +996,77 @@
     });
   }
 
-  function connectViaCloudId(options: {
-    targetDeviceId: string;
-    password?: string;
-    trustToken?: string;
-  }): void {
+  // --- Auto-reconnect ---
+  // The host app restarting (e.g. the macOS login-window instance handing over to the user's own
+  // instance right after a remote login), a host crash or a network drop must not leave the viewer
+  // frozen on the last frame: keep retrying the last target for a while.
+  const RECONNECT_WINDOW_MS = 120_000;
+  const HOST_SILENCE_TIMEOUT_MS = 10_000;
+  let lastConnect: ((isRetry: boolean) => void) | null = null;
+  let reconnectUntil = 0;
+  let reconnectTimer: number | null = null;
+  let sessionEstablished = false;
+  let lastHostActivityAt = 0;
+
+  function isReconnecting(): boolean {
+    return reconnectUntil > Date.now();
+  }
+
+  function cancelReconnect(): void {
+    reconnectUntil = 0;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  function showReconnectingOverlay(text: string): void {
+    elViewerOverlay.classList.remove('hidden');
+    elViewerLoading.classList.remove('hidden');
+    elViewerLoadingText.textContent = text;
+  }
+
+  function startReconnect(reason: string): void {
+    if (!lastConnect || isReconnecting()) return;
+    console.log(`[ClientViewer] Connection lost (${reason}), reconnecting`);
     disconnectClientViewer(false);
+    reconnectUntil = Date.now() + RECONNECT_WINDOW_MS;
+    showReconnectingOverlay(`${reason} — đang tự kết nối lại...`);
+    scheduleReconnect(1500);
+  }
+
+  function scheduleReconnect(delayMs: number): void {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (!isReconnecting() || !lastConnect) {
+      cancelReconnect();
+      disconnectClientViewer(false);
+      elConnectStatusMsg.textContent = 'Không thể kết nối lại với máy đích. Hãy thử kết nối lại sau.';
+      showToast('Không thể kết nối lại với máy đích', 'error');
+      return;
+    }
+    const retry = lastConnect;
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null;
+      retry(true);
+    }, delayMs);
+  }
+
+  function noteHostActivity(): void {
+    lastHostActivityAt = Date.now();
+  }
+
+  function connectViaCloudId(
+    options: {
+      targetDeviceId: string;
+      password?: string;
+      trustToken?: string;
+    },
+    isRetry = false
+  ): void {
+    if (!isRetry) cancelReconnect(); // a user-initiated connect replaces any pending retry
+    disconnectClientViewer(false);
+    lastConnect = (retry) => connectViaCloudId(options, retry);
+    if (isRetry) showReconnectingOverlay('Đang kết nối lại với máy đích...');
 
     const formattedId = formatDeviceIdDisplay(options.targetDeviceId);
     clientTransport = 'cloud';
@@ -1030,10 +1095,15 @@
     if (clientConnectTimer) clearTimeout(clientConnectTimer);
     clientConnectTimer = window.setTimeout(() => {
       elBtnConnectNow.disabled = false;
+      swiftdesk.stopClientCloudSession(clientTargetDeviceId, clientSessionId);
+      if (isReconnecting()) {
+        // Host still restarting (e.g. user session starting after login): keep trying
+        scheduleReconnect(1500);
+        return;
+      }
       elConnectStatusMsg.textContent = `Không tìm thấy thiết bị ${formattedId}. Hãy chắc chắn máy đích đang mở SwiftDesk.`;
       showToast(`Thiết bị ${formattedId} hiện không phản hồi`, 'error');
-      swiftdesk.stopClientCloudSession(clientTargetDeviceId, clientSessionId);
-    }, 7500);
+    }, isRetry ? 4000 : 7500); // retries poll faster so the session resumes soon after the host is back
 
     swiftdesk.sendClientCloudMessage(formattedId, {
       type: 'auth-request',
@@ -1047,13 +1117,19 @@
     });
   }
 
-  function connectViaDirectIp(options: {
-    ip: string;
-    port: number;
-    password?: string;
-    trustToken?: string;
-  }): void {
+  function connectViaDirectIp(
+    options: {
+      ip: string;
+      port: number;
+      password?: string;
+      trustToken?: string;
+    },
+    isRetry = false
+  ): void {
+    if (!isRetry) cancelReconnect();
     disconnectClientViewer(false);
+    lastConnect = (retry) => connectViaDirectIp(options, retry);
+    if (isRetry) showReconnectingOverlay('Đang kết nối lại với máy đích...');
 
     const { ip, port } = options;
     clientTransport = 'ws';
@@ -1078,8 +1154,10 @@
     if (clientConnectTimer) clearTimeout(clientConnectTimer);
     clientConnectTimer = window.setTimeout(() => {
       if (ws.readyState !== WebSocket.OPEN) {
-        ws.close();
+        const retrying = isReconnecting();
+        ws.close(); // onclose schedules the next attempt while reconnecting
         elBtnConnectNow.disabled = false;
+        if (retrying) return;
         elConnectStatusMsg.textContent = `Không thể kết nối tới ${ip}:${port}. Bạn có thể nhập Mã ID 9 số của máy đích.`;
         showToast(`Không phản hồi từ ${ip}:${port}`, 'error');
       }
@@ -1113,6 +1191,15 @@
     ws.onclose = () => {
       if (clientConnectTimer) clearTimeout(clientConnectTimer);
       elBtnConnectNow.disabled = false;
+      if (ws !== clientWs) return; // closed on purpose / superseded by a newer attempt
+      if (sessionEstablished) {
+        startReconnect('Mất kết nối tới máy đích');
+        return;
+      }
+      if (isReconnecting()) {
+        scheduleReconnect(2500);
+        return;
+      }
       if (!elViewerOverlay.classList.contains('hidden') && clientTransport === 'ws') {
         showToast('Phiên điều khiển từ xa đã kết thúc', 'info');
         disconnectClientViewer(false);
@@ -1132,12 +1219,14 @@
     }
 
     if (msg.type === 'pong' && msg.ts) {
+      noteHostActivity();
       currentPingMs = Math.max(1, Date.now() - msg.ts);
       elStatPing.textContent = `${currentPingMs} ms`;
       return;
     }
 
     if (msg.type === 'video-frame' && msg.dataUrl) {
+      noteHostActivity();
       sendClientSignaling({ type: 'frame-ack', frameId: msg.frameId });
       if (!clientHasWebRtcVideo) {
         elViewerLoading.classList.add('hidden');
@@ -1163,6 +1252,7 @@
     }
 
     if (msg.type === 'auth-failed') {
+      cancelReconnect();
       elBtnConnectNow.disabled = false;
       elConnectStatusMsg.textContent = msg.message || 'Xác thực thất bại';
       showToast(msg.message || 'Sai mật khẩu máy đích', 'error');
@@ -1179,6 +1269,10 @@
     }
 
     if (msg.type === 'auth-success') {
+      if (isReconnecting()) showToast('Đã kết nối lại với máy đích', 'success');
+      cancelReconnect();
+      sessionEstablished = true;
+      noteHostActivity();
       elBtnConnectNow.disabled = false;
       elConnectStatusMsg.textContent = '';
 
@@ -1259,7 +1353,12 @@
         } catch {}
       }
     } else if (msg.type === 'session-closed') {
+      if (msg.reconnect && sessionEstablished) {
+        startReconnect('Máy đích đang khởi động lại SwiftDesk');
+        return;
+      }
       showToast(msg.reason || 'Máy chủ đã đóng kết nối', 'info');
+      cancelReconnect();
       disconnectClientViewer(false);
     }
   }
@@ -1274,6 +1373,7 @@
       try {
         const data = JSON.parse(ev.data);
         if (data.type === 'dc-pong' && data.ts) {
+          noteHostActivity();
           currentPingMs = Math.max(1, Date.now() - data.ts);
           elStatPing.textContent = `${currentPingMs} ms`;
         } else if (data.type === 'host-stats') {
@@ -1435,6 +1535,11 @@
     lastStatsTime = performance.now();
 
     clientStatsTimer = window.setInterval(async () => {
+      // No pong / frame from the host for a while: it vanished (killed, crashed, network gone)
+      if (sessionEstablished && Date.now() - lastHostActivityAt > HOST_SILENCE_TIMEOUT_MS) {
+        startReconnect('Mất tín hiệu từ máy đích');
+        return;
+      }
       const reports = new Map<string, any>();
       if (clientPc) {
         try {
@@ -1483,6 +1588,7 @@
       elViewerStats.classList.toggle('limited', !!lastHostStats && lastHostStats.limit !== 'none');
       setStatPath(pathLabel, pathLabel === 'TURN' ? 'turn' : 'p2p');
       if (fps > 0 && fps <= 144) {
+        noteHostActivity();
         elStatFps.textContent = `${fps} FPS`;
       }
       if (elRemoteVideo.videoWidth && elRemoteVideo.videoHeight) {
@@ -1508,6 +1614,7 @@
   function disconnectClientViewer(notifyRemote = true): void {
     // Must run while the channels are still open
     releaseHeldRemoteInputs();
+    sessionEstablished = false;
     if (clientConnectTimer) {
       clearTimeout(clientConnectTimer);
       clientConnectTimer = null;
@@ -2129,6 +2236,7 @@
   });
 
   elBtnViewerDisconnect.addEventListener('click', () => {
+    cancelReconnect();
     disconnectClientViewer(true);
   });
 

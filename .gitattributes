@@ -1,0 +1,2 @@
+# Shell scripts run on macOS: keep LF even when committed from Windows
+*.sh text eol=lf
