@@ -44,6 +44,7 @@ export interface AppConfig {
   allowClipboardSync: boolean;
   mapCtrlToCmd: boolean; // Viewer on Windows/Linux controlling a Mac: Ctrl acts as ⌘ (and Win as Control)
   viewerResolution: string; // Max stream resolution: 'display' | 'native' | 'WIDTHxHEIGHT'
+  viewerCursor: 'dot' | 'arrow' | 'none'; // How the local cursor is drawn over the remote video
   savedDevices: SavedDevice[];
   trustedControllers: TrustedController[];
 }

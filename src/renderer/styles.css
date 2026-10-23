@@ -1251,6 +1251,17 @@ body {
   cursor: default;
 }
 
+/* Local cursor over the remote video. The remote cursor inside the video always trails the local one
+   by the video latency, so two arrows look "out of sync": a small dot keeps instant aim feedback while
+   the remote cursor (with its real shape: arrow, I-beam, hand...) stays the one you follow. */
+.viewer-stage.cursor-dot {
+  cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12'%3E%3Ccircle cx='6' cy='6' r='3' fill='%23ffffff' stroke='%23000000' stroke-width='1.5'/%3E%3C/svg%3E") 6 6, crosshair;
+}
+
+.viewer-stage.cursor-none {
+  cursor: none;
+}
+
 .remote-video {
   max-width: 100%;
   max-height: 100%;

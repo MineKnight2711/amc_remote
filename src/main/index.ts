@@ -254,6 +254,7 @@ function registerIpcHandlers(): void {
     allowClipboardSync?: boolean;
     mapCtrlToCmd?: boolean;
     viewerResolution?: string;
+    viewerCursor?: 'dot' | 'arrow' | 'none';
   }) => {
     const current = store.get();
     const portChanged = partial.listenPort !== undefined && partial.listenPort !== current.listenPort;

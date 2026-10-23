@@ -43,6 +43,7 @@
     allowClipboardSync: boolean;
     mapCtrlToCmd: boolean;
     viewerResolution: string;
+    viewerCursor: 'dot' | 'arrow' | 'none';
     savedDevices: SavedDevice[];
     trustedControllers: TrustedController[];
   }
@@ -309,6 +310,8 @@
   const elViewerKeysMenu = document.getElementById('viewer-keys-menu')!;
   const elKbdAltTab = document.getElementById('kbd-alttab')!;
   const elKbdWinKey = document.getElementById('kbd-winkey')!;
+  const elBtnViewerCursor = document.getElementById('btn-viewer-cursor')!;
+  const elKbdCursor = document.getElementById('kbd-cursor')!;
   const elStatPath = document.getElementById('stat-path')!;
   const elViewerResSelect = document.getElementById('viewer-res-select') as HTMLSelectElement;
   const elResPopover = document.getElementById('viewer-res-popover')!;
@@ -1528,6 +1531,7 @@
     elViewerHostName.parentElement!.title = `${hostInfo.deviceName || ''} — ${activeRemoteTargetLabel}`;
     activeRemotePlatform = String(hostInfo.platform || '');
     renderCtrlCmdToggle();
+    applyCursorMode();
     elViewerQualitySelect.value = quality;
     elViewerLoadingText.textContent = 'Đang thiết lập đường truyền P2P 60FPS độ phân giải gốc...';
     elViewerLoading.classList.remove('hidden');
@@ -1810,6 +1814,8 @@
 
   // Cloud relay (no DataChannel) is slow, so mouse moves are capped at ~30/s there
   const RELAY_MOUSE_INTERVAL_MS = 33;
+  // Over P2P a move is sent as soon as it happens (~250/s cap), instead of waiting up to a frame
+  const MOUSE_MIN_INTERVAL_MS = 4;
   // 'input-fast' may drop the last move, so the resting position is re-sent reliably once the mouse stops
   const MOUSE_SETTLE_DELAY_MS = 80;
 
@@ -1863,9 +1869,13 @@
     if (!coords) return;
     lastMouseCoords = coords;
     pendingMouseMove = coords;
-    if (!mouseFlushScheduled) {
+    if (mouseFlushScheduled) return; // a trailing send already carries the latest position
+    const waitMs = MOUSE_MIN_INTERVAL_MS - (performance.now() - lastMouseMoveSentAt);
+    if (waitMs <= 0) {
+      flushMouseMove();
+    } else {
       mouseFlushScheduled = true;
-      requestAnimationFrame(flushMouseMove);
+      window.setTimeout(flushMouseMove, waitMs);
     }
   });
 
@@ -2049,6 +2059,25 @@
         : 'Đã tắt chuyển Ctrl → ⌘ (giữ nguyên phím)',
       'info'
     );
+  });
+
+  // --- Local cursor style over the remote video ---
+  const CURSOR_MODES: Array<'dot' | 'arrow' | 'none'> = ['dot', 'arrow', 'none'];
+  const CURSOR_LABELS = { dot: 'Chấm nhỏ', arrow: 'Mũi tên', none: 'Ẩn' };
+
+  function applyCursorMode(): void {
+    const mode = currentConfig?.viewerCursor || 'dot';
+    elViewerStage.classList.toggle('cursor-dot', mode === 'dot');
+    elViewerStage.classList.toggle('cursor-none', mode === 'none');
+    elKbdCursor.textContent = CURSOR_LABELS[mode];
+  }
+
+  elBtnViewerCursor.addEventListener('click', async () => {
+    const current = currentConfig?.viewerCursor || 'dot';
+    const next = CURSOR_MODES[(CURSOR_MODES.indexOf(current) + 1) % CURSOR_MODES.length];
+    const res = await swiftdesk.updateSettings({ viewerCursor: next });
+    if (res.config) currentConfig = res.config;
+    applyCursorMode(); // menu stays open so the change is visible
   });
 
   // --- Toolbar popups (keys menu, custom resolution) ---
