@@ -68,9 +68,12 @@ function isUserLoggedIn(): boolean {
   }
 }
 
+// A second launch hands its arguments to the running instance (second-instance below) and must then
+// quit without initializing anything: no logger, no MQTT client with the same Cloud ID, no server
+const hasInstanceLock = isMultiInstanceAllowed || app.requestSingleInstanceLock();
+
 if (!isMultiInstanceAllowed) {
-  const gotLock = app.requestSingleInstanceLock();
-  if (!gotLock) {
+  if (!hasInstanceLock) {
     app.quit();
   } else {
     app.on('second-instance', (_event, argv) => {
@@ -405,6 +408,7 @@ function onSessionsChanged(): void {
 }
 
 app.whenReady().then(async () => {
+  if (!hasInstanceLock) return; // another SwiftDesk already runs; it was notified, we are quitting
   const logPath = initFileLogger();
   console.log(`[Main] Writing log to ${logPath}`);
 
@@ -489,7 +493,7 @@ app.whenReady().then(async () => {
 let quitCleanupDone = false;
 app.on('before-quit', (e) => {
   isQuitting = true;
-  if (quitCleanupDone) return;
+  if (quitCleanupDone || !hasInstanceLock) return; // a refused second instance has nothing to clean up
   console.log('[Main] Quit requested (tray, ⌘Q / app menu, or system shutdown)');
   // Hold the quit until router port mappings are removed (some routers only support permanent leases)
   e.preventDefault();
