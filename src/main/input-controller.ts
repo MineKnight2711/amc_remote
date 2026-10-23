@@ -141,41 +141,49 @@ export class InputController {
   // Counters only: key identities are never recorded (at the login window they are a password)
   private keyStats = { received: 0, posted: 0, unmapped: 0, viaHidSource: 0 };
 
-  // Crash guard for the experimental login-window key path: a marker file is written right before the
-  // first native key post of a session and deleted once the process has stayed up a few seconds. If a
-  // post segfaults (killing the process so JS try/catch can't help), the marker survives, and the next
-  // launchd restart runs with the key path disabled — mouse and viewing still work, no crash loop.
-  private keyInjectState: 'idle' | 'armed' | 'stable' | 'disabled' = 'idle';
+  // Login-window key injection from an Electron GUI app does not reach the Secure Event Input password
+  // field and crashes the process, so it is OFF by default (viewing + mouse still work). It can be
+  // turned on with --enable-loginwindow-keys for experiments; the crash guard then disables it again
+  // after a fault (marker file written before the first native key post, cleared after a few seconds).
+  private keyInjectState: 'off' | 'idle' | 'armed' | 'stable' | 'disabled' = 'off';
   private keyInjectArmed = false;
 
   /**
    * @param loginWindow macOS pre-login instance (runs as root at the login screen).
-   * @param crashGuardFile marker path used to disable the login-window key path after a crash.
+   * @param opts allowKeyInject: attempt the experimental login-window key path; crashGuardFile: marker.
    */
-  constructor(private readonly loginWindow = false, private readonly crashGuardFile?: string) {
+  constructor(
+    private readonly loginWindow = false,
+    private readonly opts: { allowKeyInject?: boolean; crashGuardFile?: string } = {}
+  ) {
     this.initNativeBindings();
-    if (loginWindow && crashGuardFile) {
-      try {
-        if (fs.existsSync(crashGuardFile)) {
-          // Previous login-window instance crashed while sending a key: run without it this time
-          this.keyInjectState = 'disabled';
-          fs.unlinkSync(crashGuardFile); // let the next launch try again
-          console.warn('[InputController] Login-window key path disabled after a previous crash');
-        }
-      } catch {}
+    if (loginWindow && opts.allowKeyInject) {
+      this.keyInjectState = 'idle';
+      if (opts.crashGuardFile) {
+        try {
+          if (fs.existsSync(opts.crashGuardFile)) {
+            // Previous login-window instance crashed while sending a key: run without it this time
+            this.keyInjectState = 'disabled';
+            fs.unlinkSync(opts.crashGuardFile); // let the next launch try again
+            console.warn('[InputController] Login-window key path disabled after a previous crash');
+          }
+        } catch {}
+      }
     }
   }
 
   private armKeyInjectGuard(): void {
-    if (this.keyInjectArmed || !this.crashGuardFile) return;
+    if (this.keyInjectArmed) return;
     this.keyInjectArmed = true;
     this.keyInjectState = 'armed';
+    const guard = this.opts.crashGuardFile;
+    if (!guard) return;
     try {
-      fs.writeFileSync(this.crashGuardFile, new Date().toISOString());
+      fs.writeFileSync(guard, new Date().toISOString());
     } catch {}
     setTimeout(() => {
       try {
-        if (this.crashGuardFile) fs.unlinkSync(this.crashGuardFile);
+        fs.unlinkSync(guard);
       } catch {}
       if (this.keyInjectState === 'armed') this.keyInjectState = 'stable';
     }, 4000);
@@ -524,11 +532,11 @@ export class InputController {
         return;
       }
 
-      // Login window: create the key from the HID-system-state event source and post it at the HID tap,
-      // the way RustDesk does. Keys created without a source (NULL) never reached the login screen.
-      // Gated behind the crash guard so a native fault here cannot crash-loop the login-window instance.
+      // Login window (opt-in only, see keyInjectState): create the key from the HID-system-state event
+      // source as RustDesk does. Off by default because it does not reach the Secure Event Input field
+      // from an Electron GUI app and crashes; the crash guard disables it after a fault.
       let source: unknown = null;
-      if (this.loginWindow && this.keyInjectState !== 'disabled') {
+      if (this.loginWindow && (this.keyInjectState === 'idle' || this.keyInjectState === 'armed' || this.keyInjectState === 'stable')) {
         this.armKeyInjectGuard();
         source = this.hidSystemEventSource();
       }

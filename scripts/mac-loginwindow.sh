@@ -41,7 +41,22 @@ check_filevault() {
    • Hoặc tắt FileVault (System Settings › Privacy & Security › FileVault) nếu chấp nhận đánh đổi bảo mật.
 TXT
   else
-    echo "✓ FileVault đang tắt: sau khi khởi động lại, SwiftDesk sẽ chạy ở màn hình đăng nhập."
+    cat <<'TXT'
+✓ FileVault đang tắt.
+  LƯU Ý QUAN TRỌNG: gõ mật khẩu từ xa NGAY TẠI màn hình đăng nhập của macOS hiện không hoạt động.
+  Ô mật khẩu đó dùng Secure Event Input; một app như SwiftDesk không gửi phím vào đó được (chỉ xem
+  màn hình và điều khiển chuột được). RustDesk làm được vì nó cài kèm một dịch vụ hệ thống (daemon)
+  biên dịch riêng — một thành phần nằm ngoài phạm vi SwiftDesk hiện tại.
+
+  CÁCH DÙNG THỰC TẾ (vì FileVault đã tắt): bật TỰ ĐỘNG ĐĂNG NHẬP để sau khi khởi động lại, máy vào
+  thẳng phiên làm việc — nơi bàn phím, chuột của SwiftDesk hoạt động đầy đủ — mà không dừng ở màn
+  hình đăng nhập. Làm trên máy Mac:
+    System Settings › Users & Groups › (Automatically log in as...) › chọn tài khoản của bạn.
+    System Settings › Lock Screen › "Require password after..." › chọn Never (để khi ngủ dậy không
+      hiện màn hình khoá cần mật khẩu).
+  Sau đó: khởi động lại → máy tự đăng nhập → SwiftDesk trong phiên tự chạy → điều khiển được ngay,
+  gõ phím bình thường. Không cần nhập mật khẩu ở màn hình đăng nhập nữa.
+TXT
   fi
 }
 

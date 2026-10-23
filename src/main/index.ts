@@ -401,10 +401,13 @@ app.whenReady().then(async () => {
   });
 
   store = new ConfigStore(configFileArg);
-  const crashGuardFile = isLoginWindowMode
-    ? path.join(app.getPath('userData'), 'loginwindow-keyinject.crashguard')
-    : undefined;
-  inputController = new InputController(isLoginWindowMode, crashGuardFile);
+  inputController = new InputController(isLoginWindowMode, {
+    // Login-window keyboard injection is experimental and off unless explicitly enabled
+    allowKeyInject: process.argv.includes('--enable-loginwindow-keys'),
+    crashGuardFile: isLoginWindowMode
+      ? path.join(app.getPath('userData'), 'loginwindow-keyinject.crashguard')
+      : undefined,
+  });
   if (isLoginWindowMode) {
     console.log(`[Main] Input diagnostics: ${JSON.stringify(inputController.getDiagnostics())}`);
   }
