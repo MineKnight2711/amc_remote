@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+import { execFileSync } from 'child_process';
 import { screen, clipboard, systemPreferences } from 'electron';
 import { RemoteInputEvent } from '../shared/types';
 
@@ -21,17 +23,10 @@ const INPUT_KEYBOARD = 1;
 const kCGHIDEventTap = 0;
 const kCGSessionEventTap = 1;
 
-// IOKit HID system events (IOLLEvent.h). Used when Secure Event Input is on: macOS drops CGEvent
-// keystrokes then (login window, lock screen, password fields), but events posted into the IOHIDSystem
-// queue arrive like hardware keystrokes.
-const NX_KEYDOWN = 10;
-const NX_KEYUP = 11;
-const kNXEventDataVersion = 2;
-const NX_EVENT_DATA_BYTES = 128; // larger than sizeof(NXEventData) on every architecture
-const NX_DEFAULT_KEYBOARD_TYPE = 40; // generic ANSI, when LMGetKbdType() reports none (headless Mac)
-const MODIFIER_CODES = new Set([
-  'ShiftLeft', 'ShiftRight', 'ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight', 'CapsLock',
-]);
+// With Secure Event Input on (login window, lock screen, password fields) macOS drops keys posted at
+// the HID / session taps, and IOHIDPostEvent is refused (kIOReturnNotPrivileged, even as root).
+// Keys are then posted straight to the loginwindow process, which owns those password fields.
+const LOGINWINDOW_PID_TTL_MS = 5000;
 const kCGEventLeftMouseDown = 1;
 const kCGEventLeftMouseUp = 2;
 const kCGEventRightMouseDown = 3;
@@ -136,20 +131,20 @@ export class InputController {
   private macSetUnicodeString: ((ev: unknown, length: number, chars: Uint16Array) => void) | null = null;
   private macPreflightPostEvent: (() => boolean) | null = null;
   private macIsSecureInputEnabled: (() => boolean) | null = null;
-  private macNXOpenEventStatus: (() => number) | null = null;
-  private macIOHIDPostEvent:
-    | ((handle: number, type: number, loc: { x: number; y: number }, data: Buffer, ver: number, flags: number, opts: number) => number)
+  private macPostToPid: ((pid: number, ev: unknown) => void) | null = null;
+  private macDisplayBounds:
+    | ((display: number) => { origin: { x: number; y: number }; size: { width: number; height: number } })
     | null = null;
-  private macLMGetKbdType: (() => number) | null = null;
-  private hidHandle = 0;
-  private hidStatus = 'unused'; // unused | ok | err:<kern_return> | unavailable
+  private macMainDisplayId: (() => number) | null = null;
+  private loginwindowPid = { pid: 0, at: 0 };
+  private mouseBoundsSource = 'unused'; // cg WxH | electron WxH
 
   private lastMousePos = { x: 0, y: 0 };
   private buttonsDown = { left: false, middle: false, right: false };
   // Keys currently held down remotely (code -> keyCode), released if the session ends mid-press
   private keysDown = new Map<string, number>();
   // Counters only: key identities are never recorded (at the login window they are a password)
-  private keyStats = { received: 0, posted: 0, unmapped: 0, viaHid: 0 };
+  private keyStats = { received: 0, posted: 0, unmapped: 0, viaPid: 0 };
 
   /**
    * @param loginWindow macOS pre-login instance: the password field there runs Secure Event Input,
@@ -230,21 +225,18 @@ export class InputController {
           this.macPreflightPostEvent = cg.func('bool CGPreflightPostEventAccess(void)');
           const carbon = koffi.load('/System/Library/Frameworks/Carbon.framework/Carbon');
           this.macIsSecureInputEnabled = carbon.func('bool IsSecureEventInputEnabled(void)');
-          this.macLMGetKbdType = carbon.func('uint8_t LMGetKbdType(void)');
         } catch (err) {
           console.warn('[InputController] Input diagnostics unavailable:', err);
         }
-        // IOHIDSystem key posting for Secure Event Input (see NX_KEYDOWN above)
+        // Secure-input key path + display geometry straight from CoreGraphics
         try {
-          const iokit = koffi.load('/System/Library/Frameworks/IOKit.framework/IOKit');
-          koffi.struct('IOGPoint', { x: 'int16_t', y: 'int16_t' });
-          this.macNXOpenEventStatus = iokit.func('uint32_t NXOpenEventStatus(void)');
-          this.macIOHIDPostEvent = iokit.func(
-            'int IOHIDPostEvent(uint32_t handle, uint32_t eventType, IOGPoint location, const uint8_t *eventData, uint32_t eventDataVersion, uint32_t eventFlags, uint32_t options)'
-          );
+          this.macPostToPid = cg.func('void CGEventPostToPid(int pid, void* event)');
+          koffi.struct('CGSize', { width: 'double', height: 'double' });
+          koffi.struct('CGRect', { origin: 'CGPoint', size: 'CGSize' });
+          this.macDisplayBounds = cg.func('CGRect CGDisplayBounds(uint32_t display)');
+          this.macMainDisplayId = cg.func('uint32_t CGMainDisplayID(void)');
         } catch (err) {
-          this.hidStatus = 'unavailable';
-          console.warn('[InputController] IOHIDPostEvent unavailable:', err);
+          console.warn('[InputController] CoreGraphics extras unavailable:', err);
         }
       }
     } catch (err) {
@@ -269,68 +261,34 @@ export class InputController {
       keysReceived: this.keyStats.received,
       keysPosted: this.keyStats.posted,
       keysUnmapped: this.keyStats.unmapped,
-      keysViaHid: this.keyStats.viaHid,
-      hid: this.hidStatus,
-      kbdType: this.keyboardType(),
+      keysViaPid: this.keyStats.viaPid,
+      loginwindowPid: this.findLoginwindowPid() || 0,
+      mouse: this.mouseBoundsSource,
     };
   }
 
-  private isSecureInputOn(): boolean {
-    try {
-      return !!this.macIsSecureInputEnabled?.();
-    } catch {
-      return false;
-    }
-  }
-
-  private keyboardType(): number {
-    try {
-      return this.macLMGetKbdType?.() || NX_DEFAULT_KEYBOARD_TYPE;
-    } catch {
-      return NX_DEFAULT_KEYBOARD_TYPE;
-    }
-  }
-
   /**
-   * Posts a key into the IOHIDSystem event queue, where it is handled like a hardware keystroke and so
-   * reaches fields protected by Secure Event Input. Returns false if unavailable or rejected.
+   * PID of the loginwindow process drawing the current console's password field: root's at the login
+   * window, the console user's at the lock screen (one loginwindow runs per session).
    */
-  private postKeyViaIOHID(macVk: number, isDown: boolean, flags: number, key?: string): boolean {
-    if (!this.macNXOpenEventStatus || !this.macIOHIDPostEvent) return false;
-    try {
-      if (!this.hidHandle) this.hidHandle = this.macNXOpenEventStatus();
-      if (!this.hidHandle) {
-        this.hidStatus = 'err:no-handle';
-        return false;
-      }
-      // NXEventData.key: origCharSet@0 repeat@2 charSet@4 charCode@6 keyCode@8 origCharCode@10 keyboardType@16
-      const ch = key && key.length === 1 && key.charCodeAt(0) < 128 ? key.charCodeAt(0) : 0;
-      const data = Buffer.alloc(NX_EVENT_DATA_BYTES);
-      data.writeUInt16LE(ch, 6);
-      data.writeUInt16LE(macVk, 8);
-      data.writeUInt16LE(ch, 10);
-      data.writeUInt32LE(this.keyboardType(), 16);
-      const kr = this.macIOHIDPostEvent(
-        this.hidHandle,
-        isDown ? NX_KEYDOWN : NX_KEYUP,
-        { x: 0, y: 0 },
-        data,
-        kNXEventDataVersion,
-        flags,
-        0
-      );
-      if (kr !== 0) {
-        if (this.hidStatus !== `err:${kr}`) console.warn(`[InputController] IOHIDPostEvent failed: kern_return ${kr}`);
-        this.hidStatus = `err:${kr}`;
-        return false;
-      }
-      this.hidStatus = 'ok';
-      return true;
-    } catch (err) {
-      this.hidStatus = 'err:exception';
-      console.warn('[InputController] IOHIDPostEvent threw:', err);
-      return false;
+  private findLoginwindowPid(): number {
+    if (process.platform !== 'darwin') return 0;
+    const now = Date.now();
+    if (this.loginwindowPid.pid && now - this.loginwindowPid.at < LOGINWINDOW_PID_TTL_MS) {
+      return this.loginwindowPid.pid;
     }
+    let pid = 0;
+    try {
+      const consoleUid = fs.statSync('/dev/console').uid;
+      const rows = execFileSync('/bin/ps', ['-axo', 'pid=,uid=,comm='], { encoding: 'utf8' })
+        .split('\n')
+        .map((line) => /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line))
+        .filter((m): m is RegExpExecArray => !!m && /(^|\/)loginwindow$/.test(m[3].trim()));
+      const match = rows.find((m) => Number(m[2]) === consoleUid) || rows[0];
+      pid = match ? Number(match[1]) : 0;
+    } catch {}
+    this.loginwindowPid = { pid, at: now };
+    return pid;
   }
 
   public checkMacPermissions(promptUser = false): { accessibility: boolean; screen: boolean } {
@@ -349,6 +307,24 @@ export class InputController {
     const clampedX = Math.max(0, Math.min(1, normX));
     const clampedY = Math.max(0, Math.min(1, normY));
 
+    // macOS: ask CoreGraphics directly (Electron's display.id is the CGDirectDisplayID). At the login
+    // window Electron's screen module can report empty bounds, which pinned every click to (0,0).
+    if (process.platform === 'darwin' && this.macDisplayBounds) {
+      try {
+        let rect = this.macDisplayBounds(Number(displayId) || 0);
+        if (!(rect.size.width > 0) && this.macMainDisplayId) {
+          rect = this.macDisplayBounds(this.macMainDisplayId());
+        }
+        if (rect.size.width > 0 && rect.size.height > 0) {
+          this.mouseBoundsSource = `cg ${rect.size.width}x${rect.size.height}`;
+          return {
+            x: rect.origin.x + clampedX * rect.size.width,
+            y: rect.origin.y + clampedY * rect.size.height,
+          };
+        }
+      } catch {}
+    }
+
     const displays = screen.getAllDisplays();
     let targetDisplay = screen.getPrimaryDisplay();
 
@@ -357,6 +333,7 @@ export class InputController {
       if (found) targetDisplay = found;
     }
 
+    this.mouseBoundsSource = `electron ${targetDisplay.bounds.width}x${targetDisplay.bounds.height}`;
     const dipX = targetDisplay.bounds.x + clampedX * targetDisplay.bounds.width;
     const dipY = targetDisplay.bounds.y + clampedY * targetDisplay.bounds.height;
 
@@ -538,18 +515,9 @@ export class InputController {
         return;
       }
 
-      // Secure Event Input (login window, lock screen, password fields) silently drops CGEvent keys:
-      // go through the IOHIDSystem instead. Modifier state rides on each key's flags, so modifier
-      // keys themselves are not posted there.
-      if ((this.loginWindow || this.isSecureInputOn()) && this.macIOHIDPostEvent) {
-        if (MODIFIER_CODES.has(code)) return;
-        if (this.postKeyViaIOHID(macVk, isDown, modifiers ? macModifierFlags(modifiers) : 0, key)) {
-          this.keyStats.posted++;
-          this.keyStats.viaHid++;
-          return;
-        }
-        // Rejected: fall through to CGEvent so non-secure targets still get the key
-      }
+      // Login window (Secure Event Input): deliver to the loginwindow process directly. Not done in the
+      // user session, where secure input may belong to a password field in another app.
+      const securePid = this.loginWindow && this.macPostToPid ? this.findLoginwindowPid() : 0;
 
       const ev = this.macCreateKeyboardEvent(null, macVk, isDown);
       if (ev) {
@@ -559,12 +527,17 @@ export class InputController {
         if (modifiers && this.macSetFlags) this.macSetFlags(ev, macModifierFlags(modifiers));
         const plainChar =
           !!key && [...key].length === 1 && !modifiers?.ctrlKey && !modifiers?.metaKey && !modifiers?.altKey;
-        if (this.loginWindow && plainChar && this.macSetUnicodeString) {
+        if ((this.loginWindow || securePid) && plainChar && this.macSetUnicodeString) {
           // Carry the character itself: no dependence on the login window's layout translation
           const units = Uint16Array.from({ length: key!.length }, (_, i) => key!.charCodeAt(i));
           this.macSetUnicodeString(ev, units.length, units);
         }
-        this.macPostEvent(this.loginWindow ? kCGSessionEventTap : kCGHIDEventTap, ev);
+        if (securePid && this.macPostToPid) {
+          this.macPostToPid(securePid, ev);
+          this.keyStats.viaPid++;
+        } else {
+          this.macPostEvent(this.loginWindow ? kCGSessionEventTap : kCGHIDEventTap, ev);
+        }
         this.macCFRelease(ev);
         this.keyStats.posted++;
       }
