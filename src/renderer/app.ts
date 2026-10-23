@@ -124,7 +124,7 @@
   } | null = null;
   let lastDiagnostics = '';
 
-  /** e.g. "input[loginWindow ax=1 post=1 secure=1 keys=12/12 unmapped=0 viaPid=12 lw=123 mouse=cg 1920x1080]" */
+  /** e.g. "input[loginWindow ax=1 post=1 secure=1 keys=12/12 unmapped=0 viaHidSrc=12 src=hid mouse=cg 1920x1080]" */
   function formatInputDiagnostics(input: Record<string, unknown> | null | undefined): string {
     if (!input) return 'input[?]';
     const b = (v: unknown) => (v === true ? '1' : v === false ? '0' : '?');
@@ -132,7 +132,7 @@
       `input[${input.loginWindow ? 'loginWindow ' : ''}ax=${b(input.accessibility)} ` +
       `post=${b(input.postEventAccess)} secure=${b(input.secureInput)} ` +
       `keys=${input.keysPosted}/${input.keysReceived} unmapped=${input.keysUnmapped} ` +
-      `viaPid=${input.keysViaPid ?? '?'} lw=${input.loginwindowPid ?? '?'} mouse=${input.mouse ?? '?'}]`
+      `viaHidSrc=${input.keysViaHidSource ?? '?'} src=${input.eventSource ?? '?'} mouse=${input.mouse ?? '?'}]`
     );
   }
 

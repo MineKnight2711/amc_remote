@@ -1,5 +1,3 @@
-import * as fs from 'fs';
-import { execFileSync } from 'child_process';
 import { screen, clipboard, systemPreferences } from 'electron';
 import { RemoteInputEvent } from '../shared/types';
 
@@ -21,12 +19,8 @@ const INPUT_KEYBOARD = 1;
 
 // macOS CGEvent Constants
 const kCGHIDEventTap = 0;
-const kCGSessionEventTap = 1;
-
-// With Secure Event Input on (login window, lock screen, password fields) macOS drops keys posted at
-// the HID / session taps, and IOHIDPostEvent is refused (kIOReturnNotPrivileged, even as root).
-// Keys are then posted straight to the loginwindow process, which owns those password fields.
-const LOGINWINDOW_PID_TTL_MS = 5000;
+// Login window keys are created from this event source (see keyboardEvent)
+const kCGEventSourceStateHIDSystemState = 1;
 const kCGEventLeftMouseDown = 1;
 const kCGEventLeftMouseUp = 2;
 const kCGEventRightMouseDown = 3;
@@ -123,7 +117,7 @@ export class InputController {
   private winInputSize = 0;
 
   private macCreateMouseEvent: ((source: null, type: number, pos: { x: number; y: number }, btn: number) => unknown) | null = null;
-  private macCreateKeyboardEvent: ((source: null, vk: number, keyDown: boolean) => unknown) | null = null;
+  private macCreateKeyboardEvent: ((source: unknown, vk: number, keyDown: boolean) => unknown) | null = null;
   private macCreateScrollEvent: ((source: null, units: number, wheelCount: number, wheel1: number, wheel2: number, wheel3: number) => unknown) | null = null;
   private macPostEvent: ((tap: number, ev: unknown) => void) | null = null;
   private macCFRelease: ((cf: unknown) => void) | null = null;
@@ -131,12 +125,12 @@ export class InputController {
   private macSetUnicodeString: ((ev: unknown, length: number, chars: Uint16Array) => void) | null = null;
   private macPreflightPostEvent: (() => boolean) | null = null;
   private macIsSecureInputEnabled: (() => boolean) | null = null;
-  private macPostToPid: ((pid: number, ev: unknown) => void) | null = null;
+  private macEventSourceCreate: ((stateId: number) => unknown) | null = null;
+  private hidEventSource: unknown = null;
   private macDisplayBounds:
     | ((display: number) => { origin: { x: number; y: number }; size: { width: number; height: number } })
     | null = null;
   private macMainDisplayId: (() => number) | null = null;
-  private loginwindowPid = { pid: 0, at: 0 };
   private mouseBoundsSource = 'unused'; // cg WxH | electron WxH
 
   private lastMousePos = { x: 0, y: 0 };
@@ -144,7 +138,7 @@ export class InputController {
   // Keys currently held down remotely (code -> keyCode), released if the session ends mid-press
   private keysDown = new Map<string, number>();
   // Counters only: key identities are never recorded (at the login window they are a password)
-  private keyStats = { received: 0, posted: 0, unmapped: 0, viaPid: 0 };
+  private keyStats = { received: 0, posted: 0, unmapped: 0, viaHidSource: 0 };
 
   /**
    * @param loginWindow macOS pre-login instance: the password field there runs Secure Event Input,
@@ -230,7 +224,7 @@ export class InputController {
         }
         // Secure-input key path + display geometry straight from CoreGraphics
         try {
-          this.macPostToPid = cg.func('void CGEventPostToPid(int pid, void* event)');
+          this.macEventSourceCreate = cg.func('void* CGEventSourceCreate(int32_t stateID)');
           koffi.struct('CGSize', { width: 'double', height: 'double' });
           koffi.struct('CGRect', { origin: 'CGPoint', size: 'CGSize' });
           this.macDisplayBounds = cg.func('CGRect CGDisplayBounds(uint32_t display)');
@@ -261,34 +255,22 @@ export class InputController {
       keysReceived: this.keyStats.received,
       keysPosted: this.keyStats.posted,
       keysUnmapped: this.keyStats.unmapped,
-      keysViaPid: this.keyStats.viaPid,
-      loginwindowPid: this.findLoginwindowPid() || 0,
+      keysViaHidSource: this.keyStats.viaHidSource,
+      eventSource: this.loginWindow ? (this.hidSystemEventSource() ? 'hid' : 'none') : 'default',
       mouse: this.mouseBoundsSource,
     };
   }
 
-  /**
-   * PID of the loginwindow process drawing the current console's password field: root's at the login
-   * window, the console user's at the lock screen (one loginwindow runs per session).
-   */
-  private findLoginwindowPid(): number {
-    if (process.platform !== 'darwin') return 0;
-    const now = Date.now();
-    if (this.loginwindowPid.pid && now - this.loginwindowPid.at < LOGINWINDOW_PID_TTL_MS) {
-      return this.loginwindowPid.pid;
+  /** Shared HID-system-state event source (created once, kept for the app's lifetime). */
+  private hidSystemEventSource(): unknown {
+    if (!this.hidEventSource && this.macEventSourceCreate) {
+      try {
+        this.hidEventSource = this.macEventSourceCreate(kCGEventSourceStateHIDSystemState) || null;
+      } catch {
+        this.hidEventSource = null;
+      }
     }
-    let pid = 0;
-    try {
-      const consoleUid = fs.statSync('/dev/console').uid;
-      const rows = execFileSync('/bin/ps', ['-axo', 'pid=,uid=,comm='], { encoding: 'utf8' })
-        .split('\n')
-        .map((line) => /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line))
-        .filter((m): m is RegExpExecArray => !!m && /(^|\/)loginwindow$/.test(m[3].trim()));
-      const match = rows.find((m) => Number(m[2]) === consoleUid) || rows[0];
-      pid = match ? Number(match[1]) : 0;
-    } catch {}
-    this.loginwindowPid = { pid, at: now };
-    return pid;
+    return this.hidEventSource;
   }
 
   public checkMacPermissions(promptUser = false): { accessibility: boolean; screen: boolean } {
@@ -377,7 +359,7 @@ export class InputController {
         case 'keydown':
         case 'keyup': {
           this.keyStats.received++;
-          this.keyboardEvent(event.code, event.keyCode, event.type === 'keydown', event, event.key);
+          this.keyboardEvent(event.code, event.keyCode, event.type === 'keydown', event);
           break;
         }
         case 'text': {
@@ -488,13 +470,7 @@ export class InputController {
     }
   }
 
-  private keyboardEvent(
-    code: string,
-    keyCode: number,
-    isDown: boolean,
-    modifiers?: ModifierState,
-    key?: string
-  ): void {
+  private keyboardEvent(code: string, keyCode: number, isDown: boolean, modifiers?: ModifierState): void {
     if (isDown) this.keysDown.set(code, keyCode);
     else this.keysDown.delete(code);
 
@@ -515,31 +491,21 @@ export class InputController {
         return;
       }
 
-      // Login window (Secure Event Input): deliver to the loginwindow process directly. Not done in the
-      // user session, where secure input may belong to a password field in another app.
-      const securePid = this.loginWindow && this.macPostToPid ? this.findLoginwindowPid() : 0;
+      // Login window: create the key from the HID-system-state event source and post it at the HID tap,
+      // the way RustDesk does (it can type into that password field). Keys created without a source
+      // (NULL) never reached it, whatever the tap or target process.
+      const source = this.loginWindow ? this.hidSystemEventSource() : null;
 
-      const ev = this.macCreateKeyboardEvent(null, macVk, isDown);
+      const ev = this.macCreateKeyboardEvent(source, macVk, isDown);
       if (ev) {
         // Stamp the viewer's real modifier state on every event: otherwise a modifier whose keyup was
         // lost (Win/Alt+Tab steal focus on the viewer) stays "held" in macOS, so every letter becomes
         // a ⌘-shortcut and nothing can be typed (⌘Q even quits SwiftDesk itself)
         if (modifiers && this.macSetFlags) this.macSetFlags(ev, macModifierFlags(modifiers));
-        const plainChar =
-          !!key && [...key].length === 1 && !modifiers?.ctrlKey && !modifiers?.metaKey && !modifiers?.altKey;
-        if ((this.loginWindow || securePid) && plainChar && this.macSetUnicodeString) {
-          // Carry the character itself: no dependence on the login window's layout translation
-          const units = Uint16Array.from({ length: key!.length }, (_, i) => key!.charCodeAt(i));
-          this.macSetUnicodeString(ev, units.length, units);
-        }
-        if (securePid && this.macPostToPid) {
-          this.macPostToPid(securePid, ev);
-          this.keyStats.viaPid++;
-        } else {
-          this.macPostEvent(this.loginWindow ? kCGSessionEventTap : kCGHIDEventTap, ev);
-        }
+        this.macPostEvent(kCGHIDEventTap, ev);
         this.macCFRelease(ev);
         this.keyStats.posted++;
+        if (source) this.keyStats.viaHidSource++;
       }
     }
   }
