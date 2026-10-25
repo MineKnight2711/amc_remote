@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import { screen, clipboard, systemPreferences } from 'electron';
 import { RemoteInputEvent } from '../shared/types';
+import { InputHelperClient, DEFAULT_HELPER_SOCKET } from './input-helper-client';
 
 // Windows Mouse Flags
 const MOUSEEVENTF_LEFTDOWN = 0x0002;
@@ -145,7 +146,9 @@ export class InputController {
   // Keys currently held down remotely (code -> keyCode), released if the session ends mid-press
   private keysDown = new Map<string, number>();
   // Counters only: key identities are never recorded (at the login window they are a password)
-  private keyStats = { received: 0, posted: 0, unmapped: 0, viaHidSource: 0 };
+  private keyStats = { received: 0, posted: 0, unmapped: 0, viaHidSource: 0, viaHelper: 0 };
+  // Privileged input helper (root LaunchDaemon) for the macOS login window / lock screen
+  private helper: InputHelperClient | null = null;
 
   // Login-window key injection from an Electron GUI app does not reach the Secure Event Input password
   // field and crashes the process, so it is OFF by default (viewing + mouse still work). It can be
@@ -160,9 +163,14 @@ export class InputController {
    */
   constructor(
     private readonly loginWindow = false,
-    private readonly opts: { allowKeyInject?: boolean; crashGuardFile?: string } = {}
+    private readonly opts: { allowKeyInject?: boolean; crashGuardFile?: string; forceHelper?: boolean } = {}
   ) {
     this.initNativeBindings();
+    if (process.platform === 'darwin') {
+      // Connect to the helper daemon; it's only used for keys when at the login window (or --force-helper)
+      this.helper = new InputHelperClient(process.env.SWIFTDESK_HELPER_SOCK || DEFAULT_HELPER_SOCKET);
+      this.helper.start();
+    }
     if (loginWindow && opts.allowKeyInject) {
       this.keyInjectState = 'idle';
       if (opts.crashGuardFile) {
@@ -303,6 +311,8 @@ export class InputController {
       keysPosted: this.keyStats.posted,
       keysUnmapped: this.keyStats.unmapped,
       keysViaHidSource: this.keyStats.viaHidSource,
+      keysViaHelper: this.keyStats.viaHelper,
+      helper: this.helper ? (this.helper.isConnected() ? (this.useHelper() ? 'on' : 'connected') : 'off') : 'n/a',
       eventSource: this.loginWindow ? (this.hidSystemEventSource() ? 'hid' : 'none') : 'default',
       keyInject: this.keyInjectState,
       mouse: this.mouseBoundsSource,
@@ -569,6 +579,14 @@ export class InputController {
         return;
       }
 
+      // Privileged helper: at the login window / lock screen, a root daemon posts the key where this
+      // sandboxed app can't. Used when at the login window (or --force-helper for testing).
+      if (this.useHelper() && this.helper!.send({ t: 'k', vk: macVk, down: isDown, flags: modifiers ? macModifierFlags(modifiers) : 0 })) {
+        this.keyStats.posted++;
+        this.keyStats.viaHelper++;
+        return;
+      }
+
       // Login window (opt-in only, see keyInjectState): create the key from the HID-system-state event
       // source as RustDesk does. Off by default because it does not reach the Secure Event Input field
       // from an Electron GUI app and crashes; the crash guard disables it after a fault.
@@ -592,8 +610,26 @@ export class InputController {
     }
   }
 
+  /**
+   * True when keys should go through the privileged helper instead of being posted locally: at the
+   * login window, while the lock screen / a password field has Secure Event Input on, or forced for
+   * testing — and only when the helper is actually connected.
+   */
+  private useHelper(): boolean {
+    if (process.platform !== 'darwin' || !this.helper?.isConnected()) return false;
+    if (this.loginWindow || this.opts.forceHelper) return true;
+    try {
+      return !!this.macIsSecureInputEnabled?.();
+    } catch {
+      return false;
+    }
+  }
+
   /** Types characters directly as Unicode, independent of the host's keyboard layout / IME. */
   private typeText(text: string): void {
+    if (this.useHelper() && this.helper!.send({ t: 'u', s: text })) {
+      return;
+    }
     const units = Uint16Array.from({ length: text.length }, (_, i) => text.charCodeAt(i));
     if (process.platform === 'win32' && this.winSendInput) {
       for (const unit of units) {
@@ -677,5 +713,9 @@ export class InputController {
     for (const [code, keyCode] of held) {
       this.keyboardEvent(code, keyCode, false, {});
     }
+  }
+
+  public dispose(): void {
+    this.helper?.dispose();
   }
 }

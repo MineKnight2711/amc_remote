@@ -8,7 +8,10 @@
     "start": "npm run build && node scripts/start-app.js",
     "dev": "npm run build && node scripts/start-app.js",
     "mac:loginwindow": "sudo bash scripts/mac-loginwindow.sh install",
-    "mac:loginwindow:uninstall": "sudo bash scripts/mac-loginwindow.sh uninstall"
+    "mac:loginwindow:uninstall": "sudo bash scripts/mac-loginwindow.sh uninstall",
+    "mac:helper": "sudo bash scripts/mac-input-helper.sh install",
+    "mac:helper:uninstall": "sudo bash scripts/mac-input-helper.sh uninstall",
+    "mac:helper:status": "sudo bash scripts/mac-input-helper.sh status"
   },
   "keywords": [
     "remote-desktop",

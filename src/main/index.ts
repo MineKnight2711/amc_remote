@@ -470,6 +470,8 @@ app.whenReady().then(async () => {
   inputController = new InputController(isLoginWindowMode, {
     // Login-window keyboard injection is experimental and off unless explicitly enabled
     allowKeyInject: process.argv.includes('--enable-loginwindow-keys'),
+    // Route keys through the privileged helper even in a normal session, for testing it while logged in
+    forceHelper: process.argv.includes('--force-helper'),
     crashGuardFile: isLoginWindowMode
       ? path.join(app.getPath('userData'), 'loginwindow-keyinject.crashguard')
       : undefined,
@@ -545,6 +547,7 @@ app.on('before-quit', (e) => {
     powerSaveBlocker.stop(powerSaveId);
   }
   kbCapture?.dispose();
+  inputController?.dispose();
   const cleanup = Promise.all([signalingServer?.stop(), upnpMapper.releaseAll()]);
   Promise.race([cleanup, new Promise((r) => setTimeout(r, 2000))])
     .catch(() => {})

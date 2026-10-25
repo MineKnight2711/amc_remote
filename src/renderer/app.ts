@@ -135,6 +135,7 @@
       `post=${b(input.postEventAccess)} secure=${b(input.secureInput)} ` +
       `keys=${input.keysPosted}/${input.keysReceived} unmapped=${input.keysUnmapped} ` +
       `viaHidSrc=${input.keysViaHidSource ?? '?'} src=${input.eventSource ?? '?'} ` +
+      `helper=${input.helper ?? '?'} viaHelper=${input.keysViaHelper ?? '?'} ` +
       `inject=${input.keyInject ?? '?'} mouse=${input.mouse ?? '?'}]`
     );
   }
