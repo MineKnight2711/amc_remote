@@ -28,6 +28,8 @@ case "${1:-install}" in
     echo "→ Biên dịch helper..."
     mkdir -p "$DEST_DIR" "/Library/Logs/SwiftDesk"
     swiftc -O -o "$BIN" "$SRC"
+    # Ad-hoc code signature: macOS won't keep an Accessibility grant for an unsigned binary
+    codesign --force --sign - "$BIN" 2>/dev/null || echo "⚠ codesign thất bại (vẫn tiếp tục)"
     chown root:wheel "$BIN"
     chmod 755 "$BIN"
 
@@ -67,12 +69,13 @@ EOF
     echo "✓ Đã cài và chạy helper."
     cat <<TXT
 
-QUAN TRỌNG — cấp quyền Trợ năng (một lần):
-  Helper vừa tự thêm mình vào danh sách, nên KHÔNG cần tìm nút "+":
-    1. Mở  System Settings › Privacy & Security › Accessibility
-    2. Tìm dòng  "swiftdesk-input-helper"  trong danh sách và BẬT công tắc của nó.
-    3. Áp dụng quyền:   npm run mac:helper:restart
-  (Nếu chưa thấy dòng đó, chạy  npm run mac:helper  một lần nữa rồi mở lại danh sách.)
+QUAN TRỌNG — cấp quyền (một lần):
+  Mở đúng trang:
+    open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+  (macOS mới gọi mục này là "Device Control and Data Access".)
+    1. Bấm nút  +  ở cuối danh sách → Cmd+Shift+G → dán:  ${BIN}
+    2. Chọn file, Open, rồi BẬT công tắc bên cạnh "swiftdesk-input-helper".
+    3. Áp dụng:   npm run mac:helper:restart
 
 Kiểm tra:
   npm start -- --force-helper
