@@ -14,12 +14,22 @@
 
 import Foundation
 import CoreGraphics
+import ApplicationServices
 import Darwin
 
 let SOCKET_PATH = "/var/run/com.swiftdesk.inputhelper.sock"
 
 func logLine(_ s: String) {
     FileHandle.standardError.write(Data(("[swiftdesk-input-helper] " + s + "\n").utf8))
+}
+
+// Registers this binary in System Settings > Privacy & Security > Accessibility (added toggled off,
+// so the user can just flip it on) and reports whether posting keys is currently permitted. Without
+// this permission macOS silently drops the keys at the login window / lock-screen password field.
+func reportAccessibility() {
+    let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as NSString
+    let trusted = AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
+    logLine("accessibility trusted = \(trusted)")
 }
 
 // One source for the whole process; HID system state is what reaches the secure login window.
@@ -105,6 +115,7 @@ func run() {
     // screen) can connect. Local socket on a personal remote-controlled Mac; it only injects input.
     chmod(SOCKET_PATH, 0o666)
     if listen(fd, 4) < 0 { logLine("listen() failed"); exit(1) }
+    reportAccessibility()
     logLine("listening on \(SOCKET_PATH)")
 
     while true {

@@ -67,20 +67,24 @@ EOF
     echo "✓ Đã cài và chạy helper."
     cat <<TXT
 
-QUAN TRỌNG — cấp quyền (một lần, khi đang đăng nhập):
-  Helper cần quyền Trợ năng để gõ phím. Thêm chính file binary này vào danh sách:
-    System Settings › Privacy & Security › Accessibility › nút "+"
-    → gõ Cmd+Shift+G, dán đường dẫn:  ${BIN}
-    → chọn file, và BẬT công tắc bên cạnh nó.
-  (Nếu vẫn chưa gõ được, thêm nó vào cả mục "Input Monitoring" theo cách tương tự.)
+QUAN TRỌNG — cấp quyền Trợ năng (một lần):
+  Helper vừa tự thêm mình vào danh sách, nên KHÔNG cần tìm nút "+":
+    1. Mở  System Settings › Privacy & Security › Accessibility
+    2. Tìm dòng  "swiftdesk-input-helper"  trong danh sách và BẬT công tắc của nó.
+    3. Áp dụng quyền:   npm run mac:helper:restart
+  (Nếu chưa thấy dòng đó, chạy  npm run mac:helper  một lần nữa rồi mở lại danh sách.)
 
-Kiểm tra trong phiên đang đăng nhập trước khi tin dùng ở màn hình khoá:
-  Chạy SwiftDesk với:   npm start -- --force-helper
-  rồi điều khiển từ Windows và thử gõ. Dòng chẩn đoán (bấm vào thanh FPS) sẽ có "helper=on".
-  Khi đã gõ được, ở màn hình đăng nhập nó sẽ tự dùng helper.
+Kiểm tra:
+  npm start -- --force-helper
+  rồi điều khiển từ Windows và thử gõ. Bấm thanh FPS để xem dòng chẩn đoán (helper=on, viaHelper tăng).
 
-Log helper:  /Library/Logs/SwiftDesk/inputhelper.err
+Log helper (có dòng "accessibility trusted = true/false"):  /Library/Logs/SwiftDesk/inputhelper.err
 TXT
+    ;;
+
+  restart)
+    launchctl kickstart -k "system/${LABEL}" 2>/dev/null || { launchctl bootout system "$PLIST" 2>/dev/null || true; launchctl bootstrap system "$PLIST"; }
+    echo "✓ Đã khởi động lại helper (áp dụng quyền vừa cấp)."
     ;;
 
   uninstall)

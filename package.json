@@ -11,6 +11,7 @@
     "mac:loginwindow:uninstall": "sudo bash scripts/mac-loginwindow.sh uninstall",
     "mac:helper": "sudo bash scripts/mac-input-helper.sh install",
     "mac:helper:uninstall": "sudo bash scripts/mac-input-helper.sh uninstall",
+    "mac:helper:restart": "sudo bash scripts/mac-input-helper.sh restart",
     "mac:helper:status": "sudo bash scripts/mac-input-helper.sh status"
   },
   "keywords": [
