@@ -69,6 +69,7 @@ export class ConfigStore {
           mapCtrlToCmd: parsed.mapCtrlToCmd !== undefined ? parsed.mapCtrlToCmd : true,
           viewerResolution: parsed.viewerResolution || 'display',
           viewerCursor: parsed.viewerCursor || 'dot',
+          keyboardCapture: parsed.keyboardCapture !== undefined ? parsed.keyboardCapture : true,
           savedDevices: Array.isArray(parsed.savedDevices) ? parsed.savedDevices : [],
           trustedControllers: Array.isArray(parsed.trustedControllers) ? parsed.trustedControllers : [],
         };
@@ -93,6 +94,7 @@ export class ConfigStore {
       mapCtrlToCmd: true,
       viewerResolution: 'display',
       viewerCursor: 'dot',
+      keyboardCapture: true,
       savedDevices: [],
       trustedControllers: [],
     };

@@ -32,6 +32,17 @@ const api = {
   sendHostInputEvent: (ev: RemoteInputEvent) => ipcRenderer.send('host:input-event', ev),
   releaseHostInputs: () => ipcRenderer.send('host:release-inputs'),
   getInputDiagnostics: () => ipcRenderer.invoke('app:get-input-diagnostics'),
+
+  // Windows keyboard pass-through (capture)
+  isCaptureAvailable: () => ipcRenderer.invoke('viewer:capture-available'),
+  setCaptureState: (state: { enabled?: boolean; overlayOpen?: boolean }) =>
+    ipcRenderer.send('viewer:capture-state', state),
+  onCapturedKey: (callback: (key: { code: string; keyCode: number; isDown: boolean }) => void) => {
+    ipcRenderer.on('viewer:captured-key', (_e, key) => callback(key));
+  },
+  onCaptureReleased: (callback: () => void) => {
+    ipcRenderer.on('viewer:capture-released', () => callback());
+  },
   sendSignalToClient: (sessionId: string, payload: Record<string, unknown>) =>
     ipcRenderer.send('host:signal-to-client', { sessionId, payload }),
 

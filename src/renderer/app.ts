@@ -44,6 +44,7 @@
     mapCtrlToCmd: boolean;
     viewerResolution: string;
     viewerCursor: 'dot' | 'arrow' | 'none';
+    keyboardCapture: boolean;
     savedDevices: SavedDevice[];
     trustedControllers: TrustedController[];
   }
@@ -156,6 +157,7 @@
   let lastStatsTime = performance.now();
   let relayFramesCount = 0;
   let isOriginalScale = false;
+  let captureAvailable = false; // Windows global keyboard hook loaded (asked at init)
 
   // RTC Configuration with STUN only. The free openrelay.metered.ca TURN no longer issues relay
   // candidates; when P2P is impossible (symmetric NAT / CGNAT) the session falls back to frame relay.
@@ -312,6 +314,7 @@
   const elKbdWinKey = document.getElementById('kbd-winkey')!;
   const elBtnViewerCursor = document.getElementById('btn-viewer-cursor')!;
   const elBtnViewerCtrlC = document.getElementById('btn-viewer-ctrlc')!;
+  const elBtnViewerCapture = document.getElementById('btn-viewer-capture')!;
   const elKbdCursor = document.getElementById('kbd-cursor')!;
   const elStatPath = document.getElementById('stat-path')!;
   const elViewerResSelect = document.getElementById('viewer-res-select') as HTMLSelectElement;
@@ -1535,11 +1538,13 @@
     elViewerHostName.parentElement!.title = `${hostInfo.deviceName || ''} — ${activeRemoteTargetLabel}`;
     activeRemotePlatform = String(hostInfo.platform || '');
     renderCtrlCmdToggle();
+    renderCaptureToggle();
     applyCursorMode();
     elViewerQualitySelect.value = quality;
     elViewerLoadingText.textContent = 'Đang thiết lập đường truyền P2P 60FPS độ phân giải gốc...';
     elViewerLoading.classList.remove('hidden');
     elViewerOverlay.classList.remove('hidden');
+    pushCaptureState(); // after the overlay is shown, so overlayOpen is reported true
     elStatFps.textContent = '-- FPS';
     elStatPing.textContent = '-- ms';
     elStatRes.textContent = '--';
@@ -1725,6 +1730,7 @@
     }
     elRemoteVideo.srcObject = null;
     elViewerOverlay.classList.add('hidden');
+    pushCaptureState(); // overlay closed: stop capturing
     if (document.fullscreenElement) {
       document.exitFullscreen().catch(() => {});
     }
@@ -1982,36 +1988,35 @@
     MetaLeft: { code: 'ControlLeft', keyCode: 17 },
     MetaRight: { code: 'ControlRight', keyCode: 17 },
   };
-  const MODIFIER_KEY_CODES = new Set(['ControlLeft', 'ControlRight', 'MetaLeft', 'MetaRight']);
-  // Physical Ctrl/Win keys held on this machine: KeyboardEvent.ctrlKey can't tell left from right Ctrl
+  const MODIFIER_KEY_CODES = new Set([
+    'ControlLeft', 'ControlRight', 'MetaLeft', 'MetaRight', 'ShiftLeft', 'ShiftRight', 'AltLeft', 'AltRight',
+  ]);
+  const CLIPBOARD_TRIGGER_CODES = new Set(['ControlLeft', 'ControlRight', 'MetaLeft', 'MetaRight']);
+  // Modifier keys physically held on this machine, by exact code (left/right distinct). The single
+  // source of truth for both the DOM path and the captured-key path, so Ctrl→⌘ can tell them apart.
   const heldModifierCodes = new Set<string>();
 
   function isCtrlCmdSwapActive(): boolean {
     return !!currentConfig?.mapCtrlToCmd && activeRemotePlatform === 'darwin' && currentPlatform !== 'darwin';
   }
 
-  /** Modifier state as the remote should see it (left Ctrl = ⌘ when controlling a Mac). */
-  function remoteModifiers(e: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean; metaKey: boolean }) {
-    if (!isCtrlCmdSwapActive()) {
-      return { ctrlKey: e.ctrlKey, metaKey: e.metaKey, shiftKey: e.shiftKey, altKey: e.altKey };
-    }
+  /**
+   * Modifier state the remote should see, from the keys currently held (left Ctrl = ⌘ on Mac).
+   * `fallback` (a mouse event's booleans) fills in modifiers held before we saw their keydown; a Ctrl
+   * that can't be attributed to a side is treated as the left one.
+   */
+  function remoteModifiers(fallback?: { ctrlKey?: boolean; shiftKey?: boolean; altKey?: boolean; metaKey?: boolean }) {
     const leftCtrl = heldModifierCodes.has('ControlLeft');
     const rightCtrl = heldModifierCodes.has('ControlRight');
     const win = heldModifierCodes.has('MetaLeft') || heldModifierCodes.has('MetaRight');
-    // A Ctrl held since before the viewer got focus: we never saw which one, treat it as the left one
-    const unknownCtrl = e.ctrlKey && !leftCtrl && !rightCtrl;
-    return { metaKey: leftCtrl || unknownCtrl, ctrlKey: rightCtrl || win, shiftKey: e.shiftKey, altKey: e.altKey };
-  }
-
-  /** Builds the remote key event now (modifier state at press time), so it can be sent later. */
-  function buildKeyEvent(type: 'keydown' | 'keyup', e: KeyboardEvent, code: string): Record<string, unknown> {
-    let keyCode = e.keyCode;
-    if (isCtrlCmdSwapActive() && CTRL_CMD_SWAP[code]) {
-      ({ code, keyCode } = CTRL_CMD_SWAP[code]);
+    const shiftKey = heldModifierCodes.has('ShiftLeft') || heldModifierCodes.has('ShiftRight') || !!fallback?.shiftKey;
+    const altKey = heldModifierCodes.has('AltLeft') || heldModifierCodes.has('AltRight') || !!fallback?.altKey;
+    const fbCtrl = !!fallback?.ctrlKey && !leftCtrl && !rightCtrl;
+    const fbWin = !!fallback?.metaKey && !win;
+    if (!isCtrlCmdSwapActive()) {
+      return { ctrlKey: leftCtrl || rightCtrl || fbCtrl, metaKey: win || fbWin, shiftKey, altKey };
     }
-    if (type === 'keydown') pressedKeys.set(code, { key: e.key, keyCode });
-    else pressedKeys.delete(code);
-    return { type, key: e.key, code, keyCode, ...remoteModifiers(e) };
+    return { metaKey: leftCtrl || fbCtrl, ctrlKey: rightCtrl || win || fbWin, shiftKey, altKey };
   }
 
   // Key events go out immediately, except while a clipboard push is in flight for a paste: then they
@@ -2034,6 +2039,40 @@
       });
   }
 
+  // Shared by the DOM key handlers and the OS-level captured-key path (Windows pass-through). key may
+  // be '' for captured keys (the host maps by code positionally; only the IME text path needs it).
+  function sendRemoteKeyDown(code: string, keyCode: number, key: string): void {
+    if (MODIFIER_KEY_CODES.has(code)) {
+      heldModifierCodes.add(code);
+      if (CLIPBOARD_TRIGGER_CODES.has(code)) syncClipboardToRemote(); // might be the start of a paste
+    }
+    let outCode = code;
+    let outKeyCode = keyCode;
+    if (isCtrlCmdSwapActive() && CTRL_CMD_SWAP[code]) {
+      ({ code: outCode, keyCode: outKeyCode } = CTRL_CMD_SWAP[code]);
+    }
+    pressedKeys.set(outCode, { key, keyCode: outKeyCode });
+    // Hold the V of a paste until the clipboard push is actually sent
+    const pasteModHeld =
+      heldModifierCodes.has('ControlLeft') ||
+      heldModifierCodes.has('ControlRight') ||
+      heldModifierCodes.has('MetaLeft') ||
+      heldModifierCodes.has('MetaRight');
+    const waitFor = code === 'KeyV' && pasteModHeld ? clipboardSyncPromise : null;
+    sendKeyOrdered({ type: 'keydown', key, code: outCode, keyCode: outKeyCode, ...remoteModifiers() }, waitFor);
+  }
+
+  function sendRemoteKeyUp(code: string, keyCode: number, key: string): void {
+    heldModifierCodes.delete(code);
+    let outCode = code;
+    let outKeyCode = keyCode;
+    if (isCtrlCmdSwapActive() && CTRL_CMD_SWAP[code]) {
+      ({ code: outCode, keyCode: outKeyCode } = CTRL_CMD_SWAP[code]);
+    }
+    pressedKeys.delete(outCode);
+    sendKeyOrdered({ type: 'keyup', key, code: outCode, keyCode: outKeyCode, ...remoteModifiers() });
+  }
+
   elViewerStage.addEventListener('keydown', (e) => {
     if (elViewerOverlay.classList.contains('hidden')) return;
     e.stopPropagation();
@@ -2049,15 +2088,7 @@
       return;
     }
     e.preventDefault();
-    let waitFor: Promise<void> | null = null;
-    if (MODIFIER_KEY_CODES.has(code)) {
-      heldModifierCodes.add(code);
-      // Ctrl/⌘ starts a paste: push this machine's clipboard now if it changed since the last push
-      if (code === 'ControlLeft' || code === 'MetaLeft') syncClipboardToRemote();
-    } else if (code === 'KeyV' && (e.ctrlKey || e.metaKey)) {
-      waitFor = clipboardSyncPromise; // hold the V until that push has been sent
-    }
-    sendKeyOrdered(buildKeyEvent('keydown', e, code), waitFor);
+    sendRemoteKeyDown(code, e.keyCode, e.key);
   });
 
   elViewerStage.addEventListener('keypress', (e) => {
@@ -2074,9 +2105,18 @@
     e.preventDefault();
     e.stopPropagation();
     const code = resolveDomCode(e);
-    if (!code) return;
-    heldModifierCodes.delete(code);
-    sendKeyOrdered(buildKeyEvent('keyup', e, code));
+    if (code) sendRemoteKeyUp(code, e.keyCode, e.key);
+  });
+
+  // OS-level keyboard pass-through (Windows): keys the browser never sees (Win+C, Alt+Tab...) arrive
+  // here. Suppressed keys never reach the DOM, so there is no double-send with the handlers above.
+  swiftdesk.onCapturedKey((k: { code: string; keyCode: number; isDown: boolean }) => {
+    if (elViewerOverlay.classList.contains('hidden')) return;
+    if (k.isDown) sendRemoteKeyDown(k.code, k.keyCode, '');
+    else sendRemoteKeyUp(k.code, k.keyCode, '');
+  });
+  swiftdesk.onCaptureReleased(() => {
+    releaseHeldRemoteInputs(); // window lost focus: don't leave any key down on the remote
   });
 
   /** A real Control+C for the remote (stops a command in a macOS terminal), whatever the mapping. */
@@ -2136,6 +2176,36 @@
   elBtnViewerCtrlC.addEventListener('click', () => {
     sendControlC();
     closeToolbarPopups();
+    elViewerStage.focus();
+  });
+
+  // --- Windows keyboard pass-through (capture) ---
+  function pushCaptureState(): void {
+    swiftdesk.setCaptureState({
+      enabled: captureAvailable && !!currentConfig?.keyboardCapture,
+      overlayOpen: !elViewerOverlay.classList.contains('hidden'),
+    });
+  }
+
+  function renderCaptureToggle(): void {
+    const on = captureAvailable && !!currentConfig?.keyboardCapture;
+    elBtnViewerCapture.classList.toggle('hidden', !captureAvailable);
+    elBtnViewerCapture.classList.toggle('on', on);
+    elBtnViewerCapture.setAttribute('aria-checked', String(on));
+  }
+
+  elBtnViewerCapture.addEventListener('click', async () => {
+    releaseHeldRemoteInputs();
+    const res = await swiftdesk.updateSettings({ keyboardCapture: !currentConfig.keyboardCapture });
+    if (res.config) currentConfig = res.config;
+    renderCaptureToggle();
+    pushCaptureState();
+    showToast(
+      currentConfig.keyboardCapture
+        ? 'Đã bật bắt toàn bộ bàn phím. Bấm chuột ra ngoài cửa sổ để nhả.'
+        : 'Đã tắt bắt bàn phím (phím tắt của Windows hoạt động như bình thường)',
+      'info'
+    );
     elViewerStage.focus();
   });
 
@@ -2576,6 +2646,7 @@
     currentConfig = boot.config;
     currentPlatform = boot.platform;
     localNetworks = boot.networks || [];
+    captureAvailable = await swiftdesk.isCaptureAvailable().catch(() => false);
 
     if (boot.cloudOnline) {
       elCloudStatusText.textContent = `🌐 Cloud ID Online (${currentConfig.deviceId})`;

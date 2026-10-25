@@ -17,6 +17,7 @@ import { InputController } from './input-controller';
 import { HostSignalingServer, isDeviceIdFormat } from './signaling-server';
 import { TrayManager } from './tray';
 import { UpnpPortMapper } from './upnp';
+import { KeyboardCapture } from './keyboard-capture';
 import { initFileLogger, writeLine } from './logger';
 import { RemoteInputEvent, SavedDevice } from '../shared/types';
 
@@ -43,6 +44,17 @@ let signalingServer: HostSignalingServer;
 let trayManager: TrayManager;
 let powerSaveId: number | null = null;
 const upnpMapper = new UpnpPortMapper();
+
+// Windows keyboard pass-through state. Capture suppresses keys only when all three hold, so the user
+// can always release by clicking another window (the mouse is never captured).
+let kbCapture: KeyboardCapture | null = null;
+let captureEnabled = true; // user toggle (viewer config)
+let viewerOverlayOpen = false;
+let windowFocused = false;
+
+function refreshKeyboardCapture(): void {
+  kbCapture?.setCapturing(captureEnabled && viewerOverlayOpen && windowFocused);
+}
 
 const isMultiInstanceAllowed = process.argv.includes('--multi-instance');
 // Build this process started from; compared when a second instance is launched (see buildStamp)
@@ -182,6 +194,18 @@ function createMainWindow(): void {
     }
   });
 
+  // Keyboard capture must follow the window's real focus: blur (user clicked away) releases it at once
+  mainWindow.on('focus', () => {
+    windowFocused = true;
+    refreshKeyboardCapture();
+  });
+  mainWindow.on('blur', () => {
+    windowFocused = false;
+    refreshKeyboardCapture();
+    // Keys held under capture would otherwise stay down on the remote
+    mainWindow?.webContents.send('viewer:capture-released');
+  });
+
   mainWindow.on('close', (e) => {
     if (!isQuitting && store.get().minimizeToTray) {
       e.preventDefault();
@@ -191,6 +215,8 @@ function createMainWindow(): void {
 
   mainWindow.on('closed', () => {
     mainWindow = null;
+    windowFocused = false;
+    refreshKeyboardCapture();
   });
 }
 
@@ -203,6 +229,15 @@ function registerIpcHandlers(): void {
   ipcMain.on('host:release-inputs', () => {
     inputController.releaseAllInputs();
   });
+
+  // Viewer tells us when its overlay opens/closes and whether the user enabled keyboard pass-through
+  ipcMain.on('viewer:capture-state', (_event, state: { enabled?: boolean; overlayOpen?: boolean }) => {
+    if (typeof state.enabled === 'boolean') captureEnabled = state.enabled;
+    if (typeof state.overlayOpen === 'boolean') viewerOverlayOpen = state.overlayOpen;
+    refreshKeyboardCapture();
+  });
+
+  ipcMain.handle('viewer:capture-available', () => !!kbCapture?.isAvailable());
 
   ipcMain.handle('app:get-input-diagnostics', () => inputController.getDiagnostics());
 
@@ -283,6 +318,7 @@ function registerIpcHandlers(): void {
     mapCtrlToCmd?: boolean;
     viewerResolution?: string;
     viewerCursor?: 'dot' | 'arrow' | 'none';
+    keyboardCapture?: boolean;
   }) => {
     const current = store.get();
     const portChanged = partial.listenPort !== undefined && partial.listenPort !== current.listenPort;
@@ -444,6 +480,13 @@ app.whenReady().then(async () => {
 
   signalingServer = new HostSignalingServer(store, inputController, () => mainWindow, onSessionsChanged);
 
+  // Captured keys are fed to the viewer renderer, which forwards them exactly like DOM key events
+  if (!isLoginWindowMode) {
+    kbCapture = new KeyboardCapture((key) => {
+      mainWindow?.webContents.send('viewer:captured-key', key);
+    });
+  }
+
   registerIpcHandlers();
   createMainWindow();
 
@@ -501,6 +544,7 @@ app.on('before-quit', (e) => {
   if (powerSaveId !== null && powerSaveBlocker.isStarted(powerSaveId)) {
     powerSaveBlocker.stop(powerSaveId);
   }
+  kbCapture?.dispose();
   const cleanup = Promise.all([signalingServer?.stop(), upnpMapper.releaseAll()]);
   Promise.race([cleanup, new Promise((r) => setTimeout(r, 2000))])
     .catch(() => {})

@@ -45,6 +45,7 @@ export interface AppConfig {
   mapCtrlToCmd: boolean; // Viewer on Windows/Linux controlling a Mac: Ctrl acts as ⌘ (and Win as Control)
   viewerResolution: string; // Max stream resolution: 'display' | 'native' | 'WIDTHxHEIGHT'
   viewerCursor: 'dot' | 'arrow' | 'none'; // How the local cursor is drawn over the remote video
+  keyboardCapture: boolean; // Windows: capture OS-reserved key combos (Win, Alt+Tab) for the remote
   savedDevices: SavedDevice[];
   trustedControllers: TrustedController[];
 }
