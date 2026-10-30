@@ -30,6 +30,8 @@ const api = {
 
   // High-speed fire-and-forget channels for Host WebRTC & Input
   sendHostInputEvent: (ev: RemoteInputEvent) => ipcRenderer.send('host:input-event', ev),
+  // Resolves once the main process has applied the event (flow control for mouse moves / wheel)
+  applyHostInputEvent: (ev: RemoteInputEvent) => ipcRenderer.invoke('host:input-event-acked', ev),
   releaseHostInputs: () => ipcRenderer.send('host:release-inputs'),
   getInputDiagnostics: () => ipcRenderer.invoke('app:get-input-diagnostics'),
 

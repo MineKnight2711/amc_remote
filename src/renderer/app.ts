@@ -125,6 +125,13 @@
     input?: Record<string, unknown> | null;
   } | null = null;
   let lastDiagnostics = '';
+  // Viewer health timeline: tells a frozen video apart from a stuck host or a dead input path
+  let viewerSessionStartedAt = 0;
+  let lastPongAt = 0;
+  let lastHostStatsAt = 0;
+  let lastBytesReceived = 0;
+  let lastFramesReceived = 0;
+  let inputsSentSinceSample = 0;
 
   /** e.g. "input[loginWindow ax=1 post=1 secure=1 keys=12/12 unmapped=0 viaHidSrc=12 src=hid mouse=cg 1920x1080]" */
   function formatInputDiagnostics(input: Record<string, unknown> | null | undefined): string {
@@ -136,7 +143,8 @@
       `keys=${input.keysPosted}/${input.keysReceived} unmapped=${input.keysUnmapped} ` +
       `viaHidSrc=${input.keysViaHidSource ?? '?'} src=${input.eventSource ?? '?'} ` +
       `helper=${input.helper ?? '?'} viaHelper=${input.keysViaHelper ?? '?'} ` +
-      `inject=${input.keyInject ?? '?'} mouse=${input.mouse ?? '?'}]`
+      `inject=${input.keyInject ?? '?'} mouse=${input.mouse ?? '?'} ` +
+      `perf=${input.perfEvents ?? '?'}ev/${input.perfAvgMs ?? '?'}avg/${input.perfMaxMs ?? '?'}max/${input.perfLoopLagMs ?? '?'}lag]`
     );
   }
 
@@ -700,9 +708,83 @@
     }
   }
 
+  /**
+   * Feeds remote input to the main process without ever building a backlog. Applying a mouse move is a
+   * synchronous call on the main thread (SetCursorPos on Windows); when moves arrive faster than that,
+   * an unbounded IPC queue leaves the remote cursor seconds behind and starves the whole main process.
+   * So one move / wheel is in flight at a time and newer ones replace (or add up with) the waiting one.
+   * Every other event keeps its exact order, after whatever position was still waiting.
+   */
+  function createHostInputPump(
+    send: (ev: any) => void,
+    applyAcked: (ev: any) => Promise<unknown>
+  ): { push: (ev: any) => void; clear: () => void; takeCoalesced: () => number } {
+    let inFlight = false;
+    let pendingMove: any = null;
+    let pendingWheel: any = null;
+    let coalesced = 0;
+
+    const pump = (): void => {
+      if (inFlight) return;
+      const next = pendingMove || pendingWheel;
+      if (!next) return;
+      if (next === pendingMove) pendingMove = null;
+      else pendingWheel = null;
+      inFlight = true;
+      applyAcked(next)
+        .catch(() => {})
+        .then(() => {
+          inFlight = false;
+          pump();
+        });
+    };
+
+    return {
+      push(ev: any): void {
+        if (ev.type === 'mousemove') {
+          if (pendingMove) coalesced++;
+          pendingMove = ev;
+          pump();
+        } else if (ev.type === 'wheel') {
+          if (pendingWheel) {
+            pendingWheel.deltaX += ev.deltaX;
+            pendingWheel.deltaY += ev.deltaY;
+            coalesced++;
+          } else {
+            pendingWheel = ev;
+          }
+          pump();
+        } else {
+          if (pendingMove) send(pendingMove);
+          if (pendingWheel) send(pendingWheel);
+          pendingMove = null;
+          pendingWheel = null;
+          send(ev);
+        }
+      },
+      clear(): void {
+        pendingMove = null;
+        pendingWheel = null;
+      },
+      takeCoalesced(): number {
+        const n = coalesced;
+        coalesced = 0;
+        return n;
+      },
+    };
+  }
+
+  const hostInputPump = createHostInputPump(
+    (ev) => swiftdesk.sendHostInputEvent(ev),
+    (ev) => swiftdesk.applyHostInputEvent(ev)
+  );
+
   function bindHostDataChannel(channel: RTCDataChannel, sessionId: string): void {
     // Viewer vanished without a clean disconnect (network drop, crash): never leave keys held down
-    channel.onclose = () => swiftdesk.releaseHostInputs();
+    channel.onclose = () => {
+      hostInputPump.clear();
+      swiftdesk.releaseHostInputs();
+    };
     channel.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data);
@@ -721,7 +803,7 @@
             peer.lastPointerSeq = Math.max(peer.lastPointerSeq, msg.event.seq);
           }
           msg.event.displayId = peer?.activeDisplayId || msg.event.displayId;
-          swiftdesk.sendHostInputEvent(msg.event);
+          hostInputPump.push(msg.event);
         }
       } catch {}
     };
@@ -803,6 +885,9 @@
     peer.relayLastDataUrl = '';
   }
 
+  // Both sides write a per-sample health line to the log for this long after connecting
+  const HEALTH_LOG_WINDOW_MS = 45_000;
+
   async function startHostWebRTCSession(data: {
     sessionId: string;
     sourceId: string;
@@ -874,6 +959,7 @@
       await tuneSenderEncoding(peerSession);
 
       // Share encoder health with the viewer so it can tell CPU/bandwidth limits from network issues
+      const hostSessionStartedAt = Date.now();
       peerSession.statsTimer = window.setInterval(async () => {
         const input = await swiftdesk.getInputDiagnostics().catch(() => null);
         if (reliableChannel.readyState !== 'open') {
@@ -889,10 +975,24 @@
         }
         try {
           const stats = await pc.getStats();
+          let bweKbps = 0;
+          stats.forEach((r: any) => {
+            if (r.type === 'candidate-pair' && r.nominated && r.availableOutgoingBitrate) {
+              bweKbps = Math.round(r.availableOutgoingBitrate / 1000);
+            }
+          });
+          const coalesced = hostInputPump.takeCoalesced();
           stats.forEach((r: any) => {
             if (r.type !== 'outbound-rtp' || r.kind !== 'video') return;
             const codec = r.codecId ? (stats as any).get(r.codecId) : null;
             const src = peerSession.stream?.getVideoTracks()[0]?.getSettings();
+            if (Date.now() - hostSessionStartedAt < HEALTH_LOG_WINDOW_MS) {
+              console.log(
+                `[HostHealth] fps=${Math.round(r.framesPerSecond || 0)} ${r.frameWidth}x${r.frameHeight} ` +
+                  `limit=${r.qualityLimitationReason} bwe=${bweKbps}kbps coalesced=${coalesced} ` +
+                  formatInputDiagnostics(input)
+              );
+            }
             reliableChannel.send(
               JSON.stringify({
                 type: 'host-stats',
@@ -904,6 +1004,8 @@
                 limit: r.qualityLimitationReason || 'none',
                 encoder: r.encoderImplementation || '',
                 codec: codec?.mimeType || '',
+                bweKbps,
+                coalesced,
                 input,
               })
             );
@@ -1424,12 +1526,14 @@
         const data = JSON.parse(ev.data);
         if (data.type === 'dc-pong' && data.ts) {
           noteHostActivity();
+          lastPongAt = Date.now();
           currentPingMs = Math.max(1, Date.now() - data.ts);
           elStatPing.textContent = `${currentPingMs} ms`;
         } else if (data.type === 'host-stats') {
           const srcChanged =
             data.srcWidth !== lastHostStats?.srcWidth || data.srcHeight !== lastHostStats?.srcHeight;
           lastHostStats = data;
+          lastHostStatsAt = Date.now();
           if (srcChanged) renderResolutionSelect(); // "Gốc" label shows the real capture size
         }
       } catch {}
@@ -1587,6 +1691,12 @@
     lastFramesDecoded = 0;
     relayFramesCount = 0;
     lastStatsTime = performance.now();
+    viewerSessionStartedAt = Date.now();
+    lastPongAt = viewerSessionStartedAt;
+    lastHostStatsAt = viewerSessionStartedAt;
+    lastBytesReceived = 0;
+    lastFramesReceived = 0;
+    inputsSentSinceSample = 0;
 
     clientStatsTimer = window.setInterval(async () => {
       // No pong / frame from the host for a while: it vanished (killed, crashed, network gone)
@@ -1654,8 +1764,39 @@
         elStatRes.textContent = `${elRemoteVideo.videoWidth}×${elRemoteVideo.videoHeight}`;
       }
 
-      const codec = inbound.codecId ? reports.get(inbound.codecId)?.mimeType || '' : '';
       const h = lastHostStats;
+      const framesReceived = inbound.framesReceived || 0;
+      const bytesReceived = inbound.bytesReceived || 0;
+      const inputsSent = inputsSentSinceSample;
+      const pongAgeMs = Date.now() - lastPongAt;
+      const hostStatsAgeMs = Date.now() - lastHostStatsAt;
+      // Logged right after connecting, then only when something looks wrong: controlling but no new
+      // frames, or a host that stopped answering (a pong comes from its renderer, stats also need its main)
+      if (
+        Date.now() - viewerSessionStartedAt < HEALTH_LOG_WINDOW_MS ||
+        (inputsSent > 0 && fps === 0) ||
+        pongAgeMs > 5000 ||
+        hostStatsAgeMs > 5000
+      ) {
+        console.log(
+          `[ViewerHealth] decoded=${fps} recv=${framesReceived - lastFramesReceived} ` +
+            `kbps=${Math.round(((bytesReceived - lastBytesReceived) * 8) / 1000 / elapsedSec)} ` +
+            `dropped=${inbound.framesDropped || 0} freezes=${inbound.freezeCount || 0} ` +
+            `pli=${inbound.pliCount || 0} nack=${inbound.nackCount || 0} lost=${inbound.packetsLost || 0} ` +
+            `ping=${currentPingMs}ms pongAge=${pongAgeMs}ms hostStatsAge=${hostStatsAgeMs}ms ` +
+            `inputsSent=${inputsSent} fastBuffered=${clientFastChannel?.bufferedAmount ?? '?'} ` +
+            `focus=${document.hasFocus() ? 1 : 0} ice=${clientPc?.iceConnectionState} | ` +
+            (h
+              ? `host: fps=${Math.round(h.fps)} limit=${h.limit} bwe=${(h as any).bweKbps ?? '?'}kbps ` +
+                `coalesced=${(h as any).coalesced ?? '?'} ${formatInputDiagnostics(h.input)}`
+              : 'host: ?')
+        );
+      }
+      lastFramesReceived = framesReceived;
+      lastBytesReceived = bytesReceived;
+      inputsSentSinceSample = 0;
+
+      const codec = inbound.codecId ? reports.get(inbound.codecId)?.mimeType || '' : '';
       lastDiagnostics =
         `path=${pathLabel} fps=${fps} ping=${currentPingMs}ms ` +
         `rtt=${Math.round((pair?.currentRoundTripTime || 0) * 1000)}ms ` +
@@ -1759,6 +1900,7 @@
       event.seq = ++pointerSeq;
     }
     const packet = JSON.stringify({ type: 'input', event });
+    inputsSentSinceSample++;
 
     if (isFastMove && clientFastChannel && clientFastChannel.readyState === 'open') {
       clientFastChannel.send(packet);

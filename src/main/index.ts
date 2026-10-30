@@ -226,6 +226,10 @@ function registerIpcHandlers(): void {
     inputController.handleEvent(inputEvent, store.get().allowClipboardSync);
   });
 
+  ipcMain.handle('host:input-event-acked', (_event, inputEvent: RemoteInputEvent) => {
+    inputController.handleEvent(inputEvent, store.get().allowClipboardSync);
+  });
+
   ipcMain.on('host:release-inputs', () => {
     inputController.releaseAllInputs();
   });

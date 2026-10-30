@@ -147,6 +147,8 @@ export class InputController {
   private keysDown = new Map<string, number>();
   // Counters only: key identities are never recorded (at the login window they are a password)
   private keyStats = { received: 0, posted: 0, unmapped: 0, viaHidSource: 0, viaHelper: 0 };
+  // Cost of applying events on the main thread since the last getDiagnostics() call
+  private perf = { events: 0, totalMs: 0, maxMs: 0, maxLoopLagMs: 0 };
   // Privileged input helper (root LaunchDaemon) for the macOS login window / lock screen
   private helper: InputHelperClient | null = null;
 
@@ -166,6 +168,13 @@ export class InputController {
     private readonly opts: { allowKeyInject?: boolean; crashGuardFile?: string; forceHelper?: boolean } = {}
   ) {
     this.initNativeBindings();
+    // Main-thread stall detector: how late a 100ms timer fires
+    let lastTick = performance.now();
+    setInterval(() => {
+      const now = performance.now();
+      this.perf.maxLoopLagMs = Math.max(this.perf.maxLoopLagMs, now - lastTick - 100);
+      lastTick = now;
+    }, 100).unref();
     if (process.platform === 'darwin') {
       // Connect to the helper daemon; it's only used for keys when at the login window (or --force-helper)
       this.helper = new InputHelperClient(process.env.SWIFTDESK_HELPER_SOCK || DEFAULT_HELPER_SOCKET);
@@ -302,7 +311,13 @@ export class InputController {
         return null;
       }
     };
+    const perf = this.perf;
+    this.perf = { events: 0, totalMs: 0, maxMs: 0, maxLoopLagMs: 0 };
     return {
+      perfEvents: perf.events,
+      perfAvgMs: perf.events ? Number((perf.totalMs / perf.events).toFixed(2)) : 0,
+      perfMaxMs: Math.round(perf.maxMs),
+      perfLoopLagMs: Math.round(perf.maxLoopLagMs),
       loginWindow: this.loginWindow,
       accessibility: process.platform === 'darwin' ? systemPreferences.isTrustedAccessibilityClient(false) : true,
       postEventAccess: call(this.macPreflightPostEvent),
@@ -394,6 +409,7 @@ export class InputController {
   }
 
   public handleEvent(event: RemoteInputEvent, allowClipboard = true): void {
+    const startedAt = performance.now();
     try {
       switch (event.type) {
         case 'mousemove': {
@@ -442,6 +458,10 @@ export class InputController {
     } catch (err) {
       console.error('[InputController] Error handling input event:', err);
     }
+    const elapsedMs = performance.now() - startedAt;
+    this.perf.events++;
+    this.perf.totalMs += elapsedMs;
+    this.perf.maxMs = Math.max(this.perf.maxMs, elapsedMs);
   }
 
   private moveMouse(x: number, y: number): void {
